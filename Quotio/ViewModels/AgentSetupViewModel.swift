@@ -143,6 +143,16 @@ final class AgentSetupViewModel {
             currentConfiguration?.modelSlots[slot] = model
         }
         
+        // For Claude Code, preserve existing relay/proxy endpoint and token.
+        if agent == .claudeCode, saved.isProxyConfigured {
+            if let savedBaseURL = saved.baseURL, !savedBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                currentConfiguration?.proxyURL = normalizedProxyURL(savedBaseURL, for: agent)
+            }
+            if let savedAPIKey = saved.apiKey, !savedAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                currentConfiguration?.apiKey = savedAPIKey
+            }
+        }
+        
         // Update setup mode in current configuration
         currentConfiguration?.setupMode = selectedSetupMode
     }
@@ -183,6 +193,9 @@ final class AgentSetupViewModel {
     func applyConfiguration() async {
         guard let agent = selectedAgent,
               let config = currentConfiguration else { return }
+        
+        let preparedConfig = normalizedConfiguration(config, for: agent)
+        currentConfiguration = preparedConfig
 
         isConfiguring = true
         defer { isConfiguring = false }
@@ -190,7 +203,7 @@ final class AgentSetupViewModel {
         do {
             let result = try await configurationService.generateConfiguration(
                 agent: agent,
-                config: config,
+                config: preparedConfig,
                 mode: configurationMode,
                 storageOption: agent == .claudeCode ? configStorageOption : .jsonOnly,
                 detectionService: detectionService,
@@ -289,24 +302,30 @@ final class AgentSetupViewModel {
     func testConnection() async {
         guard let agent = selectedAgent,
               let config = currentConfiguration else { return }
+        
+        let preparedConfig = normalizedConfiguration(config, for: agent)
+        currentConfiguration = preparedConfig
 
         isTesting = true
         defer { isTesting = false }
 
         testResult = await configurationService.testConnection(
             agent: agent,
-            config: config
+            config: preparedConfig
         )
     }
 
     func generatePreviewConfig() async -> AgentConfigResult? {
         guard let agent = selectedAgent,
               let config = currentConfiguration else { return nil }
+        
+        let preparedConfig = normalizedConfiguration(config, for: agent)
+        currentConfiguration = preparedConfig
 
         do {
             return try await configurationService.generateConfiguration(
                 agent: agent,
-                config: config,
+                config: preparedConfig,
                 mode: .manual,
                 detectionService: detectionService,
                 availableModels: availableModels
@@ -379,8 +398,11 @@ final class AgentSetupViewModel {
         defer { isFetchingModels = false }
         var loadedFromRemote = false
 
+        let preparedConfig = normalizedConfiguration(config, for: config.agent)
+        currentConfiguration = preparedConfig
+
         do {
-            let fetchedModels = try await configurationService.fetchAvailableModels(config: config)
+            let fetchedModels = try await configurationService.fetchAvailableModels(config: preparedConfig)
             let processedModels = processModels(fetchedModels)
             self.availableModels = processedModels
             loadedFromRemote = true
@@ -399,6 +421,27 @@ final class AgentSetupViewModel {
 
         refreshVirtualModels()
         return loadedFromRemote
+    }
+    
+    private func normalizedConfiguration(_ config: AgentConfiguration, for agent: CLIAgent) -> AgentConfiguration {
+        var normalized = config
+        normalized.proxyURL = normalizedProxyURL(config.proxyURL, for: agent)
+        normalized.apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized
+    }
+    
+    private func normalizedProxyURL(_ urlString: String, for agent: CLIAgent) -> String {
+        var normalized = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        
+        if agent == .claudeCode && !normalized.isEmpty && !normalized.hasSuffix("/v1") {
+            normalized += "/v1"
+        }
+        
+        return normalized
     }
 
     private func processModels(_ fetchedModels: [AvailableModel]) -> [AvailableModel] {

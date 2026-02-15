@@ -132,9 +132,8 @@ actor AgentConfigurationService {
         if let sonnet = sonnetModel { modelSlots[.sonnet] = sonnet }
         if let haiku = haikuModel { modelSlots[.haiku] = haiku }
         
-        // Check if proxy is configured (localhost or 127.0.0.1 in base URL)
-        let isProxy = baseURL?.contains("127.0.0.1") == true || 
-                      baseURL?.contains("localhost") == true
+        // Treat any non-Anthropic endpoint as proxy/relay configured.
+        let isProxy = isClaudeProxyEndpoint(baseURL)
         
         return SavedAgentConfig(
             baseURL: baseURL,
@@ -332,6 +331,23 @@ actor AgentConfigurationService {
             value = String(value.dropFirst().dropLast())
         }
         return value.isEmpty ? nil : value
+    }
+    
+    private func isClaudeProxyEndpoint(_ baseURL: String?) -> Bool {
+        guard let baseURL else { return false }
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        
+        guard let host = URL(string: trimmed)?.host?.lowercased(), !host.isEmpty else {
+            // If it's not parseable but user explicitly configured it, keep it as custom endpoint.
+            return true
+        }
+        
+        if host == "api.anthropic.com" || host.hasSuffix(".anthropic.com") {
+            return false
+        }
+        
+        return true
     }
     
     private func extractExportValue(from line: String) -> String? {

@@ -315,9 +315,45 @@ struct AgentConfigSheet: View {
                 .font(.subheadline)
                 .fontWeight(.medium)
             
-            VStack(spacing: 6) {
-                InfoRow(label: "agents.proxyURL".localized(), value: viewModel.currentConfiguration?.proxyURL ?? "")
-                InfoRow(label: "agents.apiKey".localized(), value: maskedAPIKey, isMasked: true)
+            if agent == .claudeCode {
+                VStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("agents.proxyURL".localized())
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        
+                        TextField(
+                            "agents.proxyURL".localized(),
+                            text: Binding(
+                                get: { viewModel.currentConfiguration?.proxyURL ?? "" },
+                                set: { viewModel.currentConfiguration?.proxyURL = $0 }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("agents.apiKey".localized())
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        
+                        SecureField(
+                            "agents.apiKey".localized(),
+                            text: Binding(
+                                get: { viewModel.currentConfiguration?.apiKey ?? "" },
+                                set: { viewModel.currentConfiguration?.apiKey = $0 }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                    }
+                }
+            } else {
+                VStack(spacing: 6) {
+                    InfoRow(label: "agents.proxyURL".localized(), value: viewModel.currentConfiguration?.proxyURL ?? "")
+                    InfoRow(label: "agents.apiKey".localized(), value: maskedAPIKey, isMasked: true)
+                }
             }
         }
         .padding(14)

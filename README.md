@@ -1,250 +1,145 @@
-# Quotio
+# Quotio Claude Relay Fork
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="screenshots/menu_bar_dark.png" />
-    <source media="(prefers-color-scheme: light)" srcset="screenshots/menu_bar.png" />
-    <img alt="Quotio Banner" src="screenshots/menu_bar.png" height="600" />
-  </picture>
-</p>
+This repository is a personal fork of [nguyenphutrong/quotio](https://github.com/nguyenphutrong/quotio), focused on one practical goal:
 
-<p align="center">
-  <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg?style=flat" alt="Platform macOS" />
-  <img src="https://img.shields.io/badge/language-Swift-orange.svg?style=flat" alt="Language Swift" />
-  <img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat" alt="License MIT" />
-  <a href="https://discord.gg/dFzeZ7qS"><img src="https://img.shields.io/badge/Discord-Join%20us-5865F2.svg?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="README.vi.md"><img src="https://img.shields.io/badge/lang-Tiếng%20Việt-red.svg?style=flat" alt="Vietnamese" /></a>
-  <a href="README.zh.md"><img src="https://img.shields.io/badge/lang-zh--CN-green.svg?style=flat" alt="Chinese" /></a>
-  <a href="README.fr.md"><img src="https://img.shields.io/badge/lang-Français-blue.svg?style=flat" alt="French" /></a>
-</p>
+- make Quotio work smoothly with a Claude Code relay API (middle proxy API)
+- keep the setup simple for daily usage in Claude Code
 
-<p align="center">
-  <strong>The ultimate command center for your AI coding assistants on macOS.</strong>
-</p>
+Repository: [0xtootoo29/quotio](https://github.com/0xtootoo29/quotio)
 
-Quotio is a native macOS application for managing **CLIProxyAPI** - a local proxy server that powers your AI coding agents. It helps you manage multiple AI accounts, track quotas, and configure CLI tools in one place.
+## Why This Fork Exists
 
-## ✨ Features
+The upstream Quotio project is feature-rich. In this fork, priority is:
 
-- **🔌 Multi-Provider Support**: Connect accounts from Gemini, Claude, OpenAI Codex, Qwen, Vertex AI, iFlow, Antigravity, Kiro, Trae, and GitHub Copilot via OAuth or API keys.
-- **📊 Standalone Quota Mode**: View quota and accounts without running the proxy server - perfect for quick checks.
-- **🚀 One-Click Agent Configuration**: Auto-detect and configure AI coding tools like Claude Code, OpenCode, Gemini CLI, and more.
-- **📈 Real-time Dashboard**: Monitor request traffic, token usage, and success rates live.
-- **📉 Smart Quota Management**: Visual quota tracking per account with automatic failover strategies (Round Robin / Fill First).
-- **🔑 API Key Management**: Generate and manage API keys for your local proxy.
-- **🖥️ Menu Bar Integration**: Quick access to server status, quota overview, and custom provider icons from your menu bar.
-- **🔔 Notifications**: Alerts for low quotas, account cooling periods, or service issues.
-- **🔄 Auto-Update**: Built-in Sparkle updater for seamless updates.
-- **🌍 Multilingual**: English, Vietnamese, and Simplified Chinese support.
+1. Claude Code relay compatibility first
+2. minimal configuration path
+3. stable local verification loop
 
-## 🤖 Supported Ecosystem
+## Current Status
 
-### AI Providers
-| Provider | Auth Method |
-|----------|-------------|
-| Google Gemini | OAuth |
-| Anthropic Claude | OAuth |
-| OpenAI Codex | OAuth |
-| Qwen Code | OAuth |
-| Vertex AI | Service Account JSON |
-| iFlow | OAuth |
-| Antigravity | OAuth |
-| Kiro | OAuth |
-| GitHub Copilot | OAuth |
+### MVP A (Completed)
 
-### IDE Quota Tracking (Monitor Only)
-| IDE | Description |
-|-----|-------------|
-| Cursor | Auto-detected when installed and logged in |
-| Trae | Auto-detected when installed and logged in |
+MVP A is done and verified locally:
 
-> **Note**: These IDEs are only used for quota usage monitoring. They cannot be used as providers for the proxy.
+- Quotio can read and write Claude Code relay settings
+- Claude configuration supports direct editing of proxy URL and API key
+- existing relay settings can be detected and loaded back into setup UI
+- `/v1` normalization is handled automatically for Claude setup
+- end-to-end requests pass through Quotio and appear in logs
 
-### Compatible CLI Agents
-Quotio can automatically configure these tools to use your centralized proxy:
-- Claude Code
-- Codex CLI
-- Gemini CLI
-- Amp CLI
-- OpenCode
-- Factory Droid
+### MVP B (Planned)
 
-## 🚀 Installation
+Next step is model-based routing strategy:
 
-### Requirements
-- macOS 14.0 (Sonoma) or later
-- Internet connection for OAuth authentication
+- Opus -> relay route
+- Sonnet / Haiku -> domestic provider route
 
-### Homebrew (Recommended)
+## What Changed in This Fork
+
+Main code updates:
+
+- `Quotio/Services/AgentConfigurationService.swift`
+  - improved Claude relay endpoint detection logic
+- `Quotio/ViewModels/AgentSetupViewModel.swift`
+  - load existing relay URL/token from saved config
+  - normalize proxy URL and token before test/apply
+- `Quotio/Views/Components/AgentConfigSheet.swift`
+  - Claude setup now supports editable proxy URL and API key fields
+
+## Quick Start
+
+### 1. Build
+
+Requirements:
+
+- macOS
+- Xcode installed (full app, not command-line tools only)
+
+Build command:
+
 ```bash
-brew tap nguyenphutrong/tap
-brew install --cask quotio
+xcodebuild -project Quotio.xcodeproj -scheme Quotio -configuration Debug build
 ```
 
-### Download
-Download the latest `.dmg` from the [Releases](https://github.com/nguyenphutrong/quotio/releases) page.
+Open built app:
 
-> ⚠️ **Note**: The app is not signed with an Apple Developer certificate yet. If macOS blocks the app, run:
-> ```bash
-> xattr -cr /Applications/Quotio.app
-> ```
+```bash
+open "$HOME/Library/Developer/Xcode/DerivedData/Quotio-carfafughcvpnbdvonlotcwjdapz/Build/Products/Debug/Quotio.app"
+```
 
-### Building from Source
+If your DerivedData suffix differs, locate it with:
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/nguyenphutrong/quotio.git
-   cd Quotio
-   ```
+```bash
+find "$HOME/Library/Developer/Xcode/DerivedData" -path "*/Build/Products/Debug/Quotio.app" -print
+```
 
-2. **Open in Xcode:**
-   ```bash
-   open Quotio.xcodeproj
-   ```
+### 2. Configure Relay Provider in Quotio
 
-3. **Build and Run:**
-   - Select the "Quotio" scheme
-   - Press `Cmd + R` to build and run
+In `Providers` -> `Custom Providers`:
 
-> The app will automatically download the `CLIProxyAPI` binary on first launch.
+- add your relay provider (for example `ccmix`)
+- fill base URL and API key
+- ensure provider status is enabled
 
-## 📖 Usage
+### 3. Configure Claude Code Agent
 
-### 1. Start the Server
-Launch Quotio and click **Start** on the dashboard to initialize the local proxy server.
+In `Agents` -> `Claude Code`:
 
-### 2. Connect Accounts
-Go to **Providers** tab → Click on a provider → Authenticate via OAuth or import credentials.
+- setup mode: `Proxy`
+- config mode: `Automatic`
+- storage: `JSON` (or `Both`)
+- set proxy URL and API key
+- choose model slots (Opus/Sonnet/Haiku)
+- click `Test`, then `Apply`
 
-### 3. Configure Agents
-Go to **Agents** tab → Select an installed agent → Click **Configure** → Choose Automatic or Manual mode.
+### 4. Verify
 
-### 4. Monitor Usage
-- **Dashboard**: Overall health and traffic
-- **Quota**: Per-account usage breakdown
-- **Logs**: Raw request/response logs for debugging
+Check Claude settings:
 
-## ⚙️ Settings
+```bash
+grep -E "ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_DEFAULT_" ~/.claude/settings.json
+```
 
-- **Port**: Change the proxy listening port
-- **Routing Strategy**: Round Robin or Fill First
-- **Auto-start**: Launch proxy automatically when Quotio opens
-- **Notifications**: Toggle alerts for various events
+Expected result includes:
 
-## 📸 Screenshots
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_AUTH_TOKEN`
+- `ANTHROPIC_DEFAULT_OPUS_MODEL`
+- `ANTHROPIC_DEFAULT_SONNET_MODEL`
+- `ANTHROPIC_DEFAULT_HAIKU_MODEL`
 
-### Dashboard
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/dashboard_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/dashboard.png" />
-  <img alt="Dashboard" src="screenshots/dashboard.png" />
-</picture>
+Then send a real Claude Code request and confirm request records in Quotio `Logs` tab.
 
-### Providers
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/provider_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/provider.png" />
-  <img alt="Providers" src="screenshots/provider.png" />
-</picture>
+## Troubleshooting
 
-### Agent Setup
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/agent_setup_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/agent_setup.png" />
-  <img alt="Agent Setup" src="screenshots/agent_setup.png" />
-</picture>
+### Models list does not show expected relay models
 
-### Quota Monitoring
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/quota_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/quota.png" />
-  <img alt="Quota Monitoring" src="screenshots/quota.png" />
-</picture>
+- ensure proxy is running in Quotio
+- confirm custom provider is enabled
+- retry model refresh in Agent setup
+- restart proxy once after changing custom provider
 
-### Fallback Configuration
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/fallback_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/fallback.png" />
-  <img alt="Fallback Configuration" src="screenshots/fallback.png" />
-</picture>
+### `~/.claude/settings.json` not updated
 
-### API Keys
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/api_keys_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/api_keys.png" />
-  <img alt="API Keys" src="screenshots/api_keys.png" />
-</picture>
+- ensure setup mode is `Proxy`
+- ensure config mode is `Automatic`
+- ensure you clicked `Apply` (not just `Test`)
+- check file permissions for `~/.claude/settings.json`
 
-### Logs
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/logs_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/logs.png" />
-  <img alt="Logs" src="screenshots/logs.png" />
-</picture>
+### `rg` command not found
 
-### Settings
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/settings_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/settings.png" />
-  <img alt="Settings" src="screenshots/settings.png" />
-</picture>
+Use `grep` instead:
 
-### Menu Bar
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="screenshots/menu_bar_dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="screenshots/menu_bar.png" />
-  <img alt="Menu Bar" src="screenshots/menu_bar.png" height="600" />
-</picture>
+```bash
+grep -E "ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_DEFAULT_" ~/.claude/settings.json
+```
 
-## 🤝 Contributing
+## Upstream Credits
 
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/amazing-feature`)
-3. Commit your Changes (`git commit -m 'Add amazing feature'`)
-4. Push to the Branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+This fork is based on the excellent upstream project:
 
-## 💬 Community
+- [nguyenphutrong/quotio](https://github.com/nguyenphutrong/quotio)
 
-Join our Discord community to get help, share feedback, and connect with other users:
+## License
 
-<a href="https://discord.gg/dFzeZ7qS">
-  <img src="https://img.shields.io/badge/Discord-Join%20our%20community-5865F2.svg?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord" />
-</a>
-
-## ⭐ Star History
-
-<picture>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="
-      https://api.star-history.com/svg?repos=nguyenphutrong/quotio&type=Date&theme=dark
-    "
-  />
-  <source
-    media="(prefers-color-scheme: light)"
-    srcset="
-      https://api.star-history.com/svg?repos=nguyenphutrong/quotio&type=Date
-    "
-  />
-  <img
-    alt="Star History Chart"
-    src="https://api.star-history.com/svg?repos=nguyenphutrong/quotio&type=Date"
-  />
-</picture>
-
-## 📊 Repo Activity
-
-![Repo Activity](https://repobeats.axiom.co/api/embed/884e7349c8939bfd4bdba4bc582b6fdc0ecc21ee.svg "Repobeats analytics image")
-
-## 💖 Contributors
-
-We couldn't have done this without you. Thank you! 🙏
-
-<a href="https://github.com/nguyenphutrong/quotio/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=nguyenphutrong/quotio" />
-</a>
-
-## 📄 License
-
-MIT License. See `LICENSE` for details.
+MIT License. See `LICENSE`.
