@@ -472,14 +472,29 @@ final class AgentSetupViewModel {
 
             for mapping in mappings {
                 let alias = mapping.effectiveAlias.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !alias.isEmpty, !existing.contains(alias) else { continue }
+                guard !alias.isEmpty else { continue }
+
+                if let existingIndex = merged.firstIndex(where: { $0.name == alias }) {
+                    let existingModel = merged[existingIndex]
+                    if existingModel.routedModel == nil {
+                        merged[existingIndex] = AvailableModel(
+                            id: existingModel.id,
+                            name: existingModel.name,
+                            provider: existingModel.provider,
+                            isDefault: existingModel.isDefault,
+                            routedModel: mapping.name
+                        )
+                    }
+                    continue
+                }
 
                 merged.append(
                     AvailableModel(
                         id: alias,
                         name: alias,
                         provider: providerLabel,
-                        isDefault: false
+                        isDefault: false,
+                        routedModel: mapping.name
                     )
                 )
                 existing.insert(alias)

@@ -221,11 +221,35 @@ nonisolated struct AvailableModel: Identifiable, Codable, Hashable, Sendable {
     let name: String
     let provider: String
     let isDefault: Bool
+    let routedModel: String?
+
+    init(
+        id: String,
+        name: String,
+        provider: String,
+        isDefault: Bool,
+        routedModel: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.provider = provider
+        self.isDefault = isDefault
+        self.routedModel = routedModel
+    }
 
     var displayName: String {
-        name.split(separator: "-")
+        let prettyName = name.split(separator: "-")
             .map { $0.capitalized }
             .joined(separator: " ")
+
+        guard let routedModel,
+              !routedModel.isEmpty,
+              routedModel != name else {
+            return prettyName
+        }
+
+        // Show exact routed model id to avoid ambiguity for relay aliases.
+        return "\(prettyName) (\(routedModel))"
     }
 
     static let defaultModels: [ModelSlot: AvailableModel] = [
