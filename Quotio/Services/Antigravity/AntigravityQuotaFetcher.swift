@@ -204,6 +204,8 @@ nonisolated struct ModelQuota: Codable, Identifiable, Sendable {
         case "extra-usage": return "Extra"
         case "weekly-usage": return "Weekly"
         case "sonnet-only": return "Sonnet"
+        // Claude relay quota names
+        case "relay-budget": return "Relay Budget"
         // Gemini CLI
         case "gemini-quota": return "Gemini"
         // Trae quota names

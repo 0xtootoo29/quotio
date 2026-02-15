@@ -45,8 +45,10 @@ final class QuotaViewModel {
     @ObservationIgnored private let geminiCLIFetcher = GeminiCLIQuotaFetcher()
     @ObservationIgnored private let traeFetcher = TraeQuotaFetcher()
     @ObservationIgnored private let kiroFetcher = KiroQuotaFetcher()
+    @ObservationIgnored private let crsQuotaFetcher = CRSQuotaFetcher()
     
     @ObservationIgnored private var lastKnownAccountStatuses: [String: String] = [:]
+    @ObservationIgnored private var relayQuotaKeys: Set<String> = []
     
     var currentPage: NavigationPage = .dashboard
     var authFiles: [AuthFile] = []
@@ -211,6 +213,7 @@ final class QuotaViewModel {
         await warpFetcher.updateProxyConfiguration()
         await traeFetcher.updateProxyConfiguration()
         await kiroFetcher.updateProxyConfiguration()
+        await crsQuotaFetcher.updateProxyConfiguration()
     }
 
     private func setupRefreshCadenceCallback() {
@@ -411,22 +414,29 @@ final class QuotaViewModel {
     
     /// Refresh Claude Code quota using CLI
     private func refreshClaudeCodeQuotasInternal() async {
-        let quotas = await claudeCodeFetcher.fetchAsProviderQuota()
-        if quotas.isEmpty {
-            // Only remove if no other source has Claude data
-            if providerQuotas[.claude]?.isEmpty ?? true {
-                providerQuotas.removeValue(forKey: .claude)
-            }
+        let claudeQuotas = await claudeCodeFetcher.fetchAsProviderQuota()
+        let relayQuotas = await crsQuotaFetcher.fetchAllQuotas()
+
+        var merged = providerQuotas[.claude] ?? [:]
+
+        // Remove relay entries from last refresh before writing fresh data.
+        for key in relayQuotaKeys {
+            merged.removeValue(forKey: key)
+        }
+
+        relayQuotaKeys = Set(relayQuotas.keys)
+        for (accountKey, quota) in relayQuotas {
+            merged[accountKey] = quota
+        }
+
+        for (email, quota) in claudeQuotas {
+            merged[email] = quota
+        }
+
+        if merged.isEmpty {
+            providerQuotas.removeValue(forKey: .claude)
         } else {
-            // Merge with existing data (don't overwrite proxy data)
-            if var existing = providerQuotas[.claude] {
-                for (email, quota) in quotas {
-                    existing[email] = quota
-                }
-                providerQuotas[.claude] = existing
-            } else {
-                providerQuotas[.claude] = quotas
-            }
+            providerQuotas[.claude] = merged
         }
     }
     
