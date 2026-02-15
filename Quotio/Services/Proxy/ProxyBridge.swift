@@ -143,6 +143,8 @@ final class ProxyBridge {
         let model: String?
         let resolvedModel: String?  // Actual model used after fallback resolution
         let resolvedProvider: String?  // Actual provider used after fallback resolution
+        let inputTokens: Int?
+        let outputTokens: Int?
         let statusCode: Int?
         let durationMs: Int
         let requestSize: Int
@@ -979,6 +981,8 @@ final class ProxyBridge {
             }
         }
 
+        let tokenUsage = extractUsageTokens(fromHTTPResponseData: responseData)
+
         // Capture variables for Sendable closure
         let capturedStatusCode = statusCode
         let capturedMetadata = metadata
@@ -1037,6 +1041,8 @@ final class ProxyBridge {
                 model: capturedMetadata.model,
                 resolvedModel: resolvedModel,
                 resolvedProvider: resolvedProvider,
+                inputTokens: tokenUsage.input,
+                outputTokens: tokenUsage.output,
                 statusCode: capturedStatusCode,
                 durationMs: durationMs,
                 requestSize: requestSize,
@@ -1047,6 +1053,307 @@ final class ProxyBridge {
             )
             self?.onRequestCompleted?(requestMetadata)
         }
+    }
+
+    private nonisolated func extractUsageTokens(fromHTTPResponseData responseData: Data) -> (input: Int?, output: Int?) {
+        let parsedResponse = parseHTTPResponse(responseData)
+        guard !parsedResponse.body.isEmpty else {
+            return (nil, nil)
+        }
+
+        let jsonTokens = extractUsageTokensFromJSONBody(parsedResponse.body)
+        if jsonTokens.input != nil || jsonTokens.output != nil {
+            return jsonTokens
+        }
+
+        let sseTokens = extractUsageTokensFromSSEBody(parsedResponse.body)
+        if sseTokens.input != nil || sseTokens.output != nil {
+            return sseTokens
+        }
+
+        return (nil, nil)
+    }
+
+    private nonisolated func parseHTTPResponse(_ responseData: Data) -> (headers: [String: String], body: Data) {
+        let separator = Data([13, 10, 13, 10]) // CRLFCRLF
+        guard let boundary = responseData.range(of: separator) else {
+            return ([:], responseData)
+        }
+
+        let headerData = responseData.subdata(in: responseData.startIndex..<boundary.lowerBound)
+        var bodyData = responseData.subdata(in: boundary.upperBound..<responseData.endIndex)
+
+        var headers: [String: String] = [:]
+        if let headerString = String(data: headerData, encoding: .utf8) {
+            for line in headerString.components(separatedBy: "\r\n").dropFirst() {
+                guard let colon = line.firstIndex(of: ":") else { continue }
+                let name = String(line[..<colon]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty {
+                    headers[name] = value
+                }
+            }
+        }
+
+        if headers["transfer-encoding"]?.localizedCaseInsensitiveContains("chunked") == true,
+           let decodedChunked = decodeChunkedBody(bodyData) {
+            bodyData = decodedChunked
+        }
+
+        return (headers, bodyData)
+    }
+
+    private nonisolated func decodeChunkedBody(_ chunkedData: Data) -> Data? {
+        let bytes = Array(chunkedData)
+        var index = 0
+        var decoded = Data()
+
+        while index < bytes.count {
+            guard let lineEnd = findCRLFIndex(in: bytes, from: index) else {
+                return nil
+            }
+
+            let sizeLineBytes = bytes[index..<lineEnd]
+            guard let sizeLine = String(bytes: sizeLineBytes, encoding: .utf8) else {
+                return nil
+            }
+
+            let sizeToken = sizeLine
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+                .first ?? ""
+
+            guard let chunkSize = Int(sizeToken, radix: 16) else {
+                return nil
+            }
+
+            index = lineEnd + 2
+
+            if chunkSize == 0 {
+                return decoded
+            }
+
+            guard index + chunkSize <= bytes.count else {
+                return nil
+            }
+
+            decoded.append(contentsOf: bytes[index..<(index + chunkSize)])
+            index += chunkSize
+
+            guard index + 1 < bytes.count, bytes[index] == 13, bytes[index + 1] == 10 else {
+                return nil
+            }
+
+            index += 2
+        }
+
+        return decoded
+    }
+
+    private nonisolated func findCRLFIndex(in bytes: [UInt8], from start: Int) -> Int? {
+        guard start < bytes.count else { return nil }
+        var cursor = start
+        while cursor + 1 < bytes.count {
+            if bytes[cursor] == 13, bytes[cursor + 1] == 10 {
+                return cursor
+            }
+            cursor += 1
+        }
+        return nil
+    }
+
+    private nonisolated func extractUsageTokensFromJSONBody(_ bodyData: Data) -> (input: Int?, output: Int?) {
+        guard let object = try? JSONSerialization.jsonObject(with: bodyData) else {
+            return (nil, nil)
+        }
+
+        var inputCandidates: [Int] = []
+        var outputCandidates: [Int] = []
+        var totalCandidates: [Int] = []
+        extractUsageCandidates(
+            from: object,
+            inputCandidates: &inputCandidates,
+            outputCandidates: &outputCandidates,
+            totalCandidates: &totalCandidates
+        )
+        return mergeTokenCandidates(inputCandidates: inputCandidates, outputCandidates: outputCandidates, totalCandidates: totalCandidates)
+    }
+
+    private nonisolated func extractUsageTokensFromSSEBody(_ bodyData: Data) -> (input: Int?, output: Int?) {
+        guard let sseText = String(data: bodyData, encoding: .utf8), sseText.contains("data:") else {
+            return (nil, nil)
+        }
+
+        var inputCandidates: [Int] = []
+        var outputCandidates: [Int] = []
+        var totalCandidates: [Int] = []
+
+        for rawLine in sseText.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("data:") else { continue }
+
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !payload.isEmpty, payload != "[DONE]" else { continue }
+            guard let payloadData = payload.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: payloadData) else {
+                continue
+            }
+
+            extractUsageCandidates(
+                from: object,
+                inputCandidates: &inputCandidates,
+                outputCandidates: &outputCandidates,
+                totalCandidates: &totalCandidates
+            )
+        }
+
+        return mergeTokenCandidates(inputCandidates: inputCandidates, outputCandidates: outputCandidates, totalCandidates: totalCandidates)
+    }
+
+    private nonisolated func extractUsageCandidates(
+        from object: Any,
+        inputCandidates: inout [Int],
+        outputCandidates: inout [Int],
+        totalCandidates: inout [Int]
+    ) {
+        if let dictionary = object as? [String: Any] {
+            let usageLike = dictionary["usage"] as? [String: Any]
+            let usageMetadata = dictionary["usageMetadata"] as? [String: Any]
+            let usageMetadataSnake = dictionary["usage_metadata"] as? [String: Any]
+
+            let inputTokenKeys = [
+                "input_tokens",
+                "prompt_tokens",
+                "inputTokenCount",
+                "promptTokenCount",
+                "prompt_tokens_details.cached_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens"
+            ]
+            let outputTokenKeys = [
+                "output_tokens",
+                "completion_tokens",
+                "outputTokenCount",
+                "candidatesTokenCount",
+                "completion_tokens_details.reasoning_tokens"
+            ]
+            let totalTokenKeys = [
+                "total_tokens",
+                "totalTokenCount"
+            ]
+
+            func collectValues(from source: [String: Any]) {
+                for key in inputTokenKeys {
+                    if let value = intValue(at: key, in: source) {
+                        inputCandidates.append(value)
+                    }
+                }
+                for key in outputTokenKeys {
+                    if let value = intValue(at: key, in: source) {
+                        outputCandidates.append(value)
+                    }
+                }
+                for key in totalTokenKeys {
+                    if let value = intValue(at: key, in: source) {
+                        totalCandidates.append(value)
+                    }
+                }
+            }
+
+            collectValues(from: dictionary)
+            if let usageLike {
+                collectValues(from: usageLike)
+            }
+            if let usageMetadata {
+                collectValues(from: usageMetadata)
+            }
+            if let usageMetadataSnake {
+                collectValues(from: usageMetadataSnake)
+            }
+
+            for nested in dictionary.values {
+                extractUsageCandidates(
+                    from: nested,
+                    inputCandidates: &inputCandidates,
+                    outputCandidates: &outputCandidates,
+                    totalCandidates: &totalCandidates
+                )
+            }
+            return
+        }
+
+        if let array = object as? [Any] {
+            for item in array {
+                extractUsageCandidates(
+                    from: item,
+                    inputCandidates: &inputCandidates,
+                    outputCandidates: &outputCandidates,
+                    totalCandidates: &totalCandidates
+                )
+            }
+        }
+    }
+
+    private nonisolated func mergeTokenCandidates(
+        inputCandidates: [Int],
+        outputCandidates: [Int],
+        totalCandidates: [Int]
+    ) -> (input: Int?, output: Int?) {
+        var input = inputCandidates.max()
+        var output = outputCandidates.max()
+        let total = totalCandidates.max()
+
+        if let total {
+            if let output, input == nil {
+                input = max(total - output, 0)
+            } else if let input, output == nil {
+                output = max(total - input, 0)
+            } else if input == nil, output == nil {
+                output = total
+            }
+        }
+
+        return (input, output)
+    }
+
+    private nonisolated func intValue(at keyPath: String, in dictionary: [String: Any]) -> Int? {
+        let segments = keyPath.split(separator: ".").map(String.init)
+        guard !segments.isEmpty else { return nil }
+
+        var current: Any = dictionary
+        for segment in segments.dropLast() {
+            guard let dict = current as? [String: Any], let next = dict[segment] else {
+                return nil
+            }
+            current = next
+        }
+
+        guard let finalDictionary = current as? [String: Any] else {
+            return nil
+        }
+        return intValue(from: finalDictionary[segments.last ?? ""])
+    }
+
+    private nonisolated func intValue(from value: Any?) -> Int? {
+        guard let value else { return nil }
+
+        if let int = value as? Int {
+            return int
+        }
+
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+
+        if let double = value as? Double {
+            return Int(double.rounded())
+        }
+
+        if let string = value as? String {
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return nil
     }
     
     // MARK: - Error Response

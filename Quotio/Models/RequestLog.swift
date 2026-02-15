@@ -244,6 +244,40 @@ struct ModelStats: Codable, Sendable {
     }
 }
 
+// MARK: - Period Usage Statistics
+
+nonisolated enum TokenUsagePeriod: String, CaseIterable, Hashable, Sendable {
+    case day
+    case week
+    case month
+
+    var title: String {
+        switch self {
+        case .day: return "Today"
+        case .week: return "This Week"
+        case .month: return "This Month"
+        }
+    }
+}
+
+nonisolated struct ModelTokenUsage: Identifiable, Hashable, Sendable {
+    let id: String
+    let model: String
+    let tokenCount: Int
+    let requestCount: Int
+}
+
+nonisolated struct PeriodTokenUsage: Identifiable, Hashable, Sendable {
+    let period: TokenUsagePeriod
+    let startDate: Date
+    let endDate: Date
+    let totalTokens: Int
+    let totalRequests: Int
+    let models: [ModelTokenUsage]
+
+    var id: TokenUsagePeriod { period }
+}
+
 // MARK: - Request History Storage
 
 /// Container for persisted request history
@@ -254,8 +288,12 @@ nonisolated struct RequestHistoryStore: Codable, Sendable {
     /// Request log entries
     var entries: [RequestLog]
     
-    /// Maximum entries to keep (memory-optimized)
-    static let maxEntries = 50
+    /// Maximum entries to keep.
+    /// 5000 entries are typically enough for month-level token analytics.
+    static let maxEntries = 5000
+
+    /// Background retention floor to avoid losing period analytics when app resigns active.
+    static let backgroundRetainedEntries = 3000
     
     /// Current storage version
     static let currentVersion = 1
@@ -364,6 +402,67 @@ nonisolated struct RequestHistoryStore: Codable, Sendable {
                 )
             }
         )
+    }
+
+    /// Calculate token usage by natural day/week/month in local calendar/timezone.
+    func calculatePeriodTokenUsage(referenceDate: Date = Date(), calendar: Calendar = .current) -> [PeriodTokenUsage] {
+        TokenUsagePeriod.allCases.compactMap { period in
+            guard let interval = dateInterval(for: period, referenceDate: referenceDate, calendar: calendar) else {
+                return nil
+            }
+
+            let periodEntries = entries.filter { entry in
+                entry.timestamp >= interval.start && entry.timestamp < interval.end
+            }
+
+            let totalTokens = periodEntries.reduce(0) { partial, entry in
+                partial + (entry.totalTokens ?? 0)
+            }
+
+            let modelBuckets = Dictionary(grouping: periodEntries) { entry -> String in
+                let modelName = entry.resolvedModel ?? entry.model ?? "unknown"
+                if let provider = entry.resolvedProvider ?? entry.provider, !provider.isEmpty {
+                    return "\(provider) · \(modelName)"
+                }
+                return modelName
+            }
+
+            let modelUsages = modelBuckets.map { modelName, modelEntries in
+                ModelTokenUsage(
+                    id: modelName,
+                    model: modelName,
+                    tokenCount: modelEntries.reduce(0) { $0 + ($1.totalTokens ?? 0) },
+                    requestCount: modelEntries.count
+                )
+            }
+            .filter { $0.tokenCount > 0 }
+            .sorted { lhs, rhs in
+                if lhs.tokenCount == rhs.tokenCount {
+                    return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
+                }
+                return lhs.tokenCount > rhs.tokenCount
+            }
+
+            return PeriodTokenUsage(
+                period: period,
+                startDate: interval.start,
+                endDate: interval.end,
+                totalTokens: totalTokens,
+                totalRequests: periodEntries.count,
+                models: modelUsages
+            )
+        }
+    }
+
+    private func dateInterval(for period: TokenUsagePeriod, referenceDate: Date, calendar: Calendar) -> DateInterval? {
+        switch period {
+        case .day:
+            return calendar.dateInterval(of: .day, for: referenceDate)
+        case .week:
+            return calendar.dateInterval(of: .weekOfYear, for: referenceDate)
+        case .month:
+            return calendar.dateInterval(of: .month, for: referenceDate)
+        }
     }
 }
 

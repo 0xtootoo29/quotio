@@ -19,6 +19,13 @@ struct DashboardScreen: View {
     @State private var showTunnelSheet = false
     
     private var tunnelManager: TunnelManager { TunnelManager.shared }
+
+    private static let periodDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter
+    }()
     
     private var showGettingStarted: Bool {
         guard !hideGettingStarted else { return false }
@@ -69,6 +76,10 @@ struct DashboardScreen: View {
     /// Grouped accounts by provider (cached computation)
     private var groupedDirectAuthFiles: [AIProvider: [DirectAuthFile]] {
         Dictionary(grouping: viewModel.directAuthFiles) { $0.provider }
+    }
+
+    private var periodTokenUsage: [PeriodTokenUsage] {
+        viewModel.requestTracker.periodTokenUsage
     }
     
     var body: some View {
@@ -155,6 +166,7 @@ struct DashboardScreen: View {
             }
             
             kpiSection
+            periodTokenUsageSection
             providerSection
             endpointSection
             tunnelSection
@@ -651,6 +663,93 @@ struct DashboardScreen: View {
                 color: .orange
             )
         }
+    }
+
+    private var periodTokenUsageSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 16) {
+                periodTokenSummaryCards
+
+                ForEach(periodTokenUsage) { usage in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(usage.period.title)
+                                .font(.headline)
+
+                            Spacer()
+
+                            Text("\(usage.totalTokens.formattedCompact) tokens")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                        }
+
+                        Text(periodRangeText(for: usage))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if usage.models.isEmpty || usage.totalTokens == 0 {
+                            Text("No token usage in this period")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(Array(usage.models.prefix(8))) { modelUsage in
+                                HStack(spacing: 8) {
+                                    Text(modelUsage.model)
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+
+                                    Spacer()
+
+                                    Text(modelUsage.tokenCount.formattedCompact)
+                                        .font(.caption)
+                                        .fontWeight(.medium)
+                                        .monospacedDigit()
+
+                                    Text("· \(modelUsage.requestCount) req")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .monospacedDigit()
+                                }
+                            }
+                        }
+                    }
+
+                    if usage.period != .month {
+                        Divider()
+                    }
+                }
+            }
+        } label: {
+            Label("Natural Day/Week/Month Tokens", systemImage: "chart.bar.doc.horizontal")
+        }
+    }
+
+    private var periodTokenSummaryCards: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 12)], spacing: 12) {
+            periodSummaryCard(period: .day, icon: "sun.max.fill", color: .purple)
+            periodSummaryCard(period: .week, icon: "calendar", color: .blue)
+            periodSummaryCard(period: .month, icon: "calendar.badge.clock", color: .orange)
+        }
+    }
+
+    @ViewBuilder
+    private func periodSummaryCard(period: TokenUsagePeriod, icon: String, color: Color) -> some View {
+        let usage = periodTokenUsage.first(where: { $0.period == period })
+        KPICard(
+            title: period.title,
+            value: (usage?.totalTokens ?? 0).formattedCompact,
+            subtitle: "\(usage?.totalRequests ?? 0) req",
+            icon: icon,
+            color: color
+        )
+    }
+
+    private func periodRangeText(for usage: PeriodTokenUsage) -> String {
+        let inclusiveEnd = Calendar.current.date(byAdding: .second, value: -1, to: usage.endDate) ?? usage.endDate
+        let start = Self.periodDateFormatter.string(from: usage.startDate)
+        let end = Self.periodDateFormatter.string(from: inclusiveEnd)
+        return "\(start) - \(end)"
     }
     
     // MARK: - Provider Section

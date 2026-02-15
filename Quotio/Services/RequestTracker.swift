@@ -25,6 +25,9 @@ final class RequestTracker {
     
     /// Aggregate statistics
     private(set) var stats: RequestStats = .empty
+
+    /// Token usage grouped by natural day/week/month
+    private(set) var periodTokenUsage: [PeriodTokenUsage] = []
     
     /// Whether the tracker is active
     private(set) var isActive = false
@@ -54,6 +57,7 @@ final class RequestTracker {
     
     private init() {
         loadFromDisk()
+        refreshComputedStats()
         setupMemoryWarningObserver()
     }
     
@@ -70,11 +74,11 @@ final class RequestTracker {
     }
     
     private func trimHistoryForBackground() {
-        let reducedLimit = 10
+        let reducedLimit = RequestHistoryStore.backgroundRetainedEntries
         if store.entries.count > reducedLimit {
             store.entries = Array(store.entries.prefix(reducedLimit))
             requestHistory = store.entries
-            stats = store.calculateStats()
+            refreshComputedStats()
             saveToDisk()
             NSLog("[RequestTracker] Trimmed to \(reducedLimit) entries for background")
         }
@@ -105,8 +109,8 @@ final class RequestTracker {
             model: metadata.model,
             resolvedModel: metadata.resolvedModel,
             resolvedProvider: metadata.resolvedProvider,
-            inputTokens: nil,
-            outputTokens: nil,
+            inputTokens: metadata.inputTokens,
+            outputTokens: metadata.outputTokens,
             durationMs: metadata.durationMs,
             statusCode: metadata.statusCode,
             requestSize: metadata.requestSize,
@@ -123,7 +127,7 @@ final class RequestTracker {
     func addEntry(_ entry: RequestLog) {
         store.addEntry(entry)
         requestHistory = store.entries
-        stats = store.calculateStats()
+        refreshComputedStats()
         saveToDisk()
     }
     
@@ -131,7 +135,7 @@ final class RequestTracker {
     func clearHistory() {
         store = .empty
         requestHistory = []
-        stats = .empty
+        refreshComputedStats()
         saveToDisk()
     }
     
@@ -160,7 +164,7 @@ final class RequestTracker {
             decoder.dateDecodingStrategy = .iso8601  // Match the encoding strategy
             store = try decoder.decode(RequestHistoryStore.self, from: data)
             requestHistory = store.entries
-            stats = store.calculateStats()
+            refreshComputedStats()
             NSLog("[RequestTracker] Loaded \(store.entries.count) entries from disk")
         } catch {
             NSLog("[RequestTracker] Failed to load history: \(error)")
@@ -188,5 +192,10 @@ final class RequestTracker {
                 NSLog("[RequestTracker] Failed to save history: \(error)")
             }
         }
+    }
+
+    private func refreshComputedStats() {
+        stats = store.calculateStats()
+        periodTokenUsage = store.calculatePeriodTokenUsage()
     }
 }
