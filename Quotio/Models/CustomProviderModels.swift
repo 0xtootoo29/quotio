@@ -471,10 +471,11 @@ extension CustomProvider {
             return []
         }
 
+        let slotModels = inferredSlotModels(forRelaySlug: relaySlug)
         return [
-            ModelMapping(name: "claude-opus-4-6", alias: "\(relaySlug)-opus"),
-            ModelMapping(name: "claude-sonnet-4-5-20250929", alias: "\(relaySlug)-sonnet"),
-            ModelMapping(name: "claude-haiku-4-5-20251001", alias: "\(relaySlug)-haiku")
+            ModelMapping(name: slotModels.opus, alias: "\(relaySlug)-opus"),
+            ModelMapping(name: slotModels.sonnet, alias: "\(relaySlug)-sonnet"),
+            ModelMapping(name: slotModels.haiku, alias: "\(relaySlug)-haiku")
         ]
     }
 
@@ -524,6 +525,41 @@ extension CustomProvider {
         )
         let trimmed = dedupedDashes.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return trimmed.isEmpty ? "relay" : trimmed
+    }
+
+    private struct RelaySlotModels {
+        let opus: String
+        let sonnet: String
+        let haiku: String
+    }
+
+    /// Infer slot target models for known relay channels.
+    /// Claude Code still has Opus/Sonnet/Haiku slots; for non-Claude channels
+    /// we map those slots to provider-specific model IDs.
+    private func inferredSlotModels(forRelaySlug relaySlug: String) -> RelaySlotModels {
+        let hint = "\(relaySlug) \(name) \(baseURL)".lowercased()
+
+        if hint.contains("glm") {
+            return RelaySlotModels(
+                opus: "glm-5",
+                sonnet: "glm-4.7",
+                haiku: "glm-4.7"
+            )
+        }
+
+        if hint.contains("minimax") || hint.contains("m2.5") {
+            return RelaySlotModels(
+                opus: "MiniMax-M2.5",
+                sonnet: "MiniMax-M2.1",
+                haiku: "MiniMax-M2.1-lightning"
+            )
+        }
+
+        return RelaySlotModels(
+            opus: "claude-opus-4-6-20260205",
+            sonnet: "claude-sonnet-4-5-20250929",
+            haiku: "claude-haiku-4-5-20251001"
+        )
     }
 }
 
