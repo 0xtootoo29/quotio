@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-02-15
+
+### Added
+
+- **oauth**: Add copy URL option for OAuth login flow (#325)
+  - Copy authorization URL to clipboard for manual browser entry
+  - Useful when default browser doesn't open automatically
+- **tunnel**: Add auto-restart tunnel on disconnect option (#323)
+  - Automatically restart Cloudflare tunnel when connection drops
+  - Configurable in Settings with on/off toggle
+
+### Fixed
+
+- **menubar**: Hide CLI-based providers from menu bar when CLI not installed (#320)
+  - Cleaner menu bar display by hiding inactive providers
+- **tunnel**: Use HTTP/2 protocol for Cloudflare tunnels (#319)
+  - Improved tunnel stability with HTTP/2 transport
+- **codex**: Unify Codex quota account identity (#315)
+  - Fix duplicate account display when using both Codex CLI and OpenAI fetcher
+  - Consistent account identification across different auth methods
+- **auth**: Use local timezone for expired field to match existing auth files (#314)
+  - Fix timezone mismatch causing auth validation issues
+
 ## [0.12.0] - 2026-02-12
 
 ### Added

@@ -4,7 +4,7 @@
 
 ## Overview
 
-- **Lines:** 1008
+- **Lines:** 1043
 - **Language:** Swift
 - **Symbols:** 27
 - **Public symbols:** 0
@@ -39,7 +39,7 @@
 | 709 | struct | MenuBarHintView | (internal) | `struct MenuBarHintView` |
 | 724 | struct | OAuthSheet | (internal) | `struct OAuthSheet` |
 | 850 | struct | OAuthStatusView | (private) | `struct OAuthStatusView` |
-| 987 | enum | CustomProviderSheetMode | (internal) | `enum CustomProviderSheetMode` |
+| 1022 | enum | CustomProviderSheetMode | (internal) | `enum CustomProviderSheetMode` |
 
 ## Memory Markers
 

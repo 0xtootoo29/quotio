@@ -367,6 +367,7 @@ final class QuotaViewModel {
         _ = await (antigravity, openai, copilot, claudeCode, codexCLI, geminiCLI, glm, warp, kiro)
         
         checkQuotaNotifications()
+        pruneMenuBarItems()
         autoSelectMenuBarItems()
 
         isLoadingQuotas = false
@@ -1195,6 +1196,7 @@ final class QuotaViewModel {
         }
 
         checkQuotaNotifications()
+        pruneMenuBarItems()
         autoSelectMenuBarItems()
 
         isLoadingQuotas = false
@@ -1234,6 +1236,7 @@ final class QuotaViewModel {
         }
 
         checkQuotaNotifications()
+        pruneMenuBarItems()
         autoSelectMenuBarItems()
 
         isLoadingQuotas = false
@@ -1385,11 +1388,12 @@ final class QuotaViewModel {
                 return
             }
             
+            // Auto-open browser AND store URL for copy/open buttons
             if let url = URL(string: urlString) {
                 NSWorkspace.shared.open(url)
             }
             
-            oauthState = OAuthState(provider: provider, status: .polling, state: state)
+            oauthState = OAuthState(provider: provider, status: .polling, state: state, authURL: urlString)
             await pollOAuthStatus(state: state, provider: provider)
             
         } catch {
@@ -1804,6 +1808,7 @@ final class QuotaViewModel {
         savePersistedIDEQuotas()
 
         // Update menu bar items
+        pruneMenuBarItems()
         autoSelectMenuBarItems()
 
         notifyQuotaDataChanged()
@@ -1914,6 +1919,7 @@ struct OAuthState {
     var status: OAuthStatus
     var state: String?
     var error: String?
+    var authURL: String?
     
     enum OAuthStatus {
         case waiting, polling, success, error
