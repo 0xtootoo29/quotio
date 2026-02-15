@@ -2,7 +2,7 @@
 //  CRSQuotaFetcher.swift
 //  Quotio
 //
-//  Fetches relay quota stats from CRS admin APIs.
+//  Fetches relay quota stats from relay admin APIs.
 //
 
 import Foundation
@@ -13,6 +13,13 @@ actor CRSQuotaFetcher {
         let apiKey: String
         let statsBaseURL: String
         let pathPrefixes: [String]
+        let configuredEndpoint: String
+        let groupHint: String?
+    }
+
+    private struct EndpointSignature: Equatable, Sendable {
+        let host: String
+        let path: String
     }
 
     private var session: URLSession
@@ -80,7 +87,9 @@ actor CRSQuotaFetcher {
                         accountKey: accountKey,
                         apiKey: apiKey,
                         statsBaseURL: statsConfig.baseURL,
-                        pathPrefixes: statsConfig.pathPrefixes
+                        pathPrefixes: statsConfig.pathPrefixes,
+                        configuredEndpoint: statsConfig.configuredEndpoint,
+                        groupHint: statsConfig.groupHint
                     )
                 )
             }
@@ -88,14 +97,15 @@ actor CRSQuotaFetcher {
         return targets
     }
 
-    private func resolveStatsBaseConfiguration(provider: CustomProvider, keyEntry: CustomAPIKeyEntry) -> (baseURL: String, pathPrefixes: [String])? {
+    private func resolveStatsBaseConfiguration(provider: CustomProvider, keyEntry: CustomAPIKeyEntry) -> (baseURL: String, pathPrefixes: [String], configuredEndpoint: String, groupHint: String?)? {
         let candidates: [String?] = [keyEntry.proxyURL, provider.baseURL]
 
         for candidate in candidates {
             guard let candidate = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !candidate.isEmpty,
                   let url = normalizedURL(from: candidate),
-                  let host = url.host?.lowercased() else {
+                  let host = url.host?.lowercased(),
+                  host.hasSuffix("itssx.com") else {
                 continue
             }
 
@@ -104,22 +114,23 @@ actor CRSQuotaFetcher {
             if let port = url.port {
                 base += ":\(port)"
             }
-            return (baseURL: base, pathPrefixes: endpointPathPrefixes(from: url.path))
+
+            let normalizedPath = normalizePath(url.path)
+            let configuredEndpoint = normalizedPath.isEmpty ? base : base + normalizedPath
+            let groupHint = endpointHint(from: normalizedPath)
+
+            return (
+                baseURL: base,
+                pathPrefixes: endpointPathPrefixes(from: normalizedPath),
+                configuredEndpoint: configuredEndpoint,
+                groupHint: groupHint
+            )
         }
 
         return nil
     }
 
-    private func endpointPathPrefixes(from rawPath: String) -> [String] {
-        let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedPath: String
-
-        if trimmedPath.isEmpty || trimmedPath == "/" {
-            normalizedPath = ""
-        } else {
-            normalizedPath = "/" + trimmedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        }
-
+    private func endpointPathPrefixes(from normalizedPath: String) -> [String] {
         var prefixes: [String] = [""]
 
         if !normalizedPath.isEmpty {
@@ -146,6 +157,19 @@ actor CRSQuotaFetcher {
         return deduped
     }
 
+    private func normalizePath(_ rawPath: String) -> String {
+        let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedPath.isEmpty || trimmedPath == "/" {
+            return ""
+        }
+        return "/" + trimmedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private func endpointHint(from normalizedPath: String) -> String? {
+        guard !normalizedPath.isEmpty else { return nil }
+        return normalizedPath.split(separator: "/").last.map(String.init)
+    }
+
     private func normalizedURL(from raw: String) -> URL? {
         if let url = URL(string: raw), url.host != nil {
             return url
@@ -154,14 +178,40 @@ actor CRSQuotaFetcher {
     }
 
     private func fetchQuota(for target: RelayTarget) async -> ProviderQuotaData? {
+        var reasons: [String] = []
+
         do {
-            let apiID = try await fetchAPIID(target: target)
-            let statsPayload = try await fetchUserStats(target: target, apiID: apiID)
-            return quotaData(from: statsPayload)
+            if let quota = try await fetchQuotaFromRelayKeyQuery(target: target) {
+                return quota
+            }
+            reasons.append("relay key-query returned empty payload")
         } catch {
-            Log.quota("CRS quota fetch failed for \(target.accountKey): \(error.localizedDescription)")
-            return unavailableQuotaData(reason: error.localizedDescription)
+            reasons.append("relay key-query failed: \(error.localizedDescription)")
         }
+
+        do {
+            if let quota = try await fetchQuotaFromAPIStats(target: target) {
+                return quota
+            }
+            reasons.append("apiStats returned empty payload")
+        } catch {
+            reasons.append("apiStats failed: \(error.localizedDescription)")
+        }
+
+        let reason = reasons.joined(separator: " | ")
+        Log.quota("Relay quota fetch failed for \(target.accountKey): \(reason)")
+        return unavailableQuotaData(reason: reason)
+    }
+
+    private func fetchQuotaFromAPIStats(target: RelayTarget) async throws -> ProviderQuotaData? {
+        let apiID = try await fetchAPIID(target: target)
+        let statsPayload = try await fetchUserStats(target: target, apiID: apiID)
+        return quotaDataFromAPIStats(from: statsPayload)
+    }
+
+    private func fetchQuotaFromRelayKeyQuery(target: RelayTarget) async throws -> ProviderQuotaData? {
+        let payload = try await fetchRelayKeyQuery(target: target)
+        return quotaDataFromRelayKeyQuery(from: payload, target: target)
     }
 
     private func fetchAPIID(target: RelayTarget) async throws -> String {
@@ -216,12 +266,82 @@ actor CRSQuotaFetcher {
         throw lastError
     }
 
+    private func fetchRelayKeyQuery(target: RelayTarget) async throws -> [String: Any] {
+        var lastError: Error = QuotaFetchError.invalidResponse
+
+        for prefix in prioritizedRelayQueryPrefixes(from: target.pathPrefixes) {
+            guard var components = URLComponents(string: target.statsBaseURL + prefix + "/relay/key-query") else {
+                continue
+            }
+            components.queryItems = [URLQueryItem(name: "key", value: target.apiKey)]
+            guard let url = components.url else { continue }
+
+            do {
+                let payload = try await getJSON(url: url)
+                let code = intValue(from: payload["code"]) ?? 0
+                let message = (payload["msg"] as? String) ?? "relay key-query failed"
+
+                if code != 200 {
+                    throw QuotaFetchError.apiErrorMessage(message)
+                }
+
+                guard let data = payload["data"] as? [String: Any] else {
+                    throw QuotaFetchError.apiErrorMessage("relay key-query has no data")
+                }
+
+                var mergedPayload = payload
+                mergedPayload["data"] = data
+                return mergedPayload
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+
+        throw lastError
+    }
+
+    private func prioritizedRelayQueryPrefixes(from prefixes: [String]) -> [String] {
+        var ordered: [String] = []
+        if prefixes.contains("/api") {
+            ordered.append("/api")
+        }
+        for prefix in prefixes where prefix != "/api" {
+            ordered.append(prefix)
+        }
+        if ordered.isEmpty {
+            return ["/api", ""]
+        }
+        return ordered
+    }
+
     private func postJSON(url: URL, body: [String: Any]) async throws -> [String: Any] {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw QuotaFetchError.invalidResponse
+        }
+        guard 200...299 ~= httpResponse.statusCode else {
+            throw QuotaFetchError.httpError(httpResponse.statusCode)
+        }
+
+        let json = try JSONSerialization.jsonObject(with: data)
+        guard let payload = json as? [String: Any] else {
+            throw QuotaFetchError.invalidResponse
+        }
+        return payload
+    }
+
+    private func getJSON(url: URL) async throws -> [String: Any] {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -273,7 +393,7 @@ actor CRSQuotaFetcher {
         return nil
     }
 
-    private func quotaData(from payload: [String: Any]) -> ProviderQuotaData? {
+    private func quotaDataFromAPIStats(from payload: [String: Any]) -> ProviderQuotaData? {
         guard let data = payload["data"] as? [String: Any] else { return nil }
 
         let usage = data["usage"] as? [String: Any]
@@ -343,6 +463,179 @@ actor CRSQuotaFetcher {
         return ProviderQuotaData(models: models, lastUpdated: Date())
     }
 
+    private func quotaDataFromRelayKeyQuery(from payload: [String: Any], target: RelayTarget) -> ProviderQuotaData? {
+        guard let data = payload["data"] as? [String: Any] else { return nil }
+
+        let balance = doubleValue(from: data["balance"])
+        let usedQuota = doubleValue(from: data["usedQuota"])
+        let totalCostLimit = doubleValue(from: data["totalCostLimit"])
+        let totalCostUsed = doubleValue(from: data["totalCostUsed"])
+        let totalRequestLimit = intValue(from: data["totalRequestLimit"])
+        let usedRequestCount = intValue(from: data["usedRequestCount"])
+        let keyName = data["name"] as? String
+        let expireAt = data["expireAt"] as? String
+
+        let groups = data["allowedGroups"] as? [[String: Any]] ?? []
+        let group = matchedRelayGroup(in: groups, target: target)
+        let groupName = (group?["name"] as? String) ?? (group?["slug"] as? String)
+        let groupUsage = group?["usage"] as? [String: Any]
+        let groupSettings = group?["settings"] as? [String: Any]
+
+        let groupBalanceUsedValue = groupUsage?["groupBalanceUsed"]
+        let groupUsedQuotaValue = groupUsage?["usedQuota"]
+        let groupTotalCostValue = groupUsage?["groupTotalCost"]
+        let groupDailyCostValue = groupUsage?["groupDailyCost"]
+        let groupDailyUsedQuotaValue = groupUsage?["dailyUsedQuota"]
+        let groupRequestCountValue = groupUsage?["groupRequestCount"]
+        let groupUsedRequestCountValue = groupUsage?["usedRequestCount"]
+        let groupDailyQuotaValue = groupSettings?["dailyQuota"]
+        let groupTotalCostLimitValue = groupSettings?["totalCostLimit"]
+
+        let groupBalanceUsedPrimary = doubleValue(from: groupBalanceUsedValue)
+        let groupBalanceUsedFallback = doubleValue(from: groupUsedQuotaValue)
+        let groupBalanceUsed: Double?
+        if let groupBalanceUsedPrimary {
+            groupBalanceUsed = groupBalanceUsedPrimary
+        } else {
+            groupBalanceUsed = groupBalanceUsedFallback
+        }
+
+        let groupTotalCost = doubleValue(from: groupTotalCostValue)
+
+        let groupDailyCostPrimary = doubleValue(from: groupDailyCostValue)
+        let groupDailyCostFallback = doubleValue(from: groupDailyUsedQuotaValue)
+        let groupDailyCost: Double?
+        if let groupDailyCostPrimary {
+            groupDailyCost = groupDailyCostPrimary
+        } else {
+            groupDailyCost = groupDailyCostFallback
+        }
+
+        let groupRequestCountPrimary = intValue(from: groupRequestCountValue)
+        let groupRequestCountFallback = intValue(from: groupUsedRequestCountValue)
+        let groupRequestCount: Int?
+        if let groupRequestCountPrimary {
+            groupRequestCount = groupRequestCountPrimary
+        } else {
+            groupRequestCount = groupRequestCountFallback
+        }
+
+        let groupDailyQuota = doubleValue(from: groupDailyQuotaValue)
+        let groupTotalCostLimit = doubleValue(from: groupTotalCostLimitValue)
+
+        var remainingPercent: Double = -1
+        var usedValue: Int?
+        var limitValue: Int?
+        var remainingValue: Int?
+
+        if let balance, balance > 0 {
+            let used = max(0, groupBalanceUsed ?? usedQuota ?? 0)
+            let remaining = max(0, balance - used)
+            remainingPercent = min(100, max(0, (remaining / balance) * 100))
+            usedValue = Int(used.rounded())
+            limitValue = Int(balance.rounded())
+            remainingValue = Int(remaining.rounded())
+        } else if let groupTotalCostLimit, groupTotalCostLimit > 0 {
+            let used = max(0, groupTotalCost ?? totalCostUsed ?? 0)
+            let remaining = max(0, groupTotalCostLimit - used)
+            remainingPercent = min(100, max(0, (remaining / groupTotalCostLimit) * 100))
+            usedValue = Int(used.rounded())
+            limitValue = Int(groupTotalCostLimit.rounded())
+            remainingValue = Int(remaining.rounded())
+        } else if let totalCostLimit, totalCostLimit > 0 {
+            let used = max(0, totalCostUsed ?? 0)
+            let remaining = max(0, totalCostLimit - used)
+            remainingPercent = min(100, max(0, (remaining / totalCostLimit) * 100))
+            usedValue = Int(used.rounded())
+            limitValue = Int(totalCostLimit.rounded())
+            remainingValue = Int(remaining.rounded())
+        }
+
+        let tooltip = buildRelayKeyQueryTooltip(
+            keyName: keyName,
+            groupName: groupName,
+            balance: balance,
+            usedQuota: usedQuota,
+            totalRequestLimit: totalRequestLimit,
+            usedRequestCount: usedRequestCount,
+            groupBalanceUsed: groupBalanceUsed,
+            groupRequestCount: groupRequestCount,
+            groupDailyCost: groupDailyCost,
+            groupTotalCost: groupTotalCost,
+            groupDailyQuota: groupDailyQuota,
+            groupTotalCostLimit: groupTotalCostLimit
+        )
+
+        return ProviderQuotaData(
+            models: [
+                ModelQuota(
+                    name: "relay-budget",
+                    percentage: remainingPercent,
+                    resetTime: expireAt ?? "",
+                    used: usedValue,
+                    limit: limitValue,
+                    remaining: remainingValue,
+                    tooltip: tooltip
+                )
+            ],
+            lastUpdated: Date()
+        )
+    }
+
+    private func matchedRelayGroup(in groups: [[String: Any]], target: RelayTarget) -> [String: Any]? {
+        guard !groups.isEmpty else { return nil }
+
+        let configuredSignature = endpointSignature(from: target.configuredEndpoint)
+
+        if let configuredSignature {
+            if let exact = groups.first(where: { group in
+                relayEndpoints(from: group).contains { endpoint in
+                    endpointSignature(from: endpoint) == configuredSignature
+                }
+            }) {
+                return exact
+            }
+
+            if let pathMatched = groups.first(where: { group in
+                relayEndpoints(from: group).contains { endpoint in
+                    endpointSignature(from: endpoint)?.path == configuredSignature.path
+                }
+            }) {
+                return pathMatched
+            }
+        }
+
+        if let groupHint = target.groupHint?.lowercased(), !groupHint.isEmpty {
+            if let hinted = groups.first(where: { group in
+                let slug = (group["slug"] as? String ?? "").lowercased()
+                let name = (group["name"] as? String ?? "").lowercased()
+                return slug == groupHint || name.contains(groupHint)
+            }) {
+                return hinted
+            }
+        }
+
+        return groups.first
+    }
+
+    private func relayEndpoints(from group: [String: Any]) -> [String] {
+        var endpoints: [String] = []
+        if let endpointAcc = group["endpointAcc"] as? String, !endpointAcc.isEmpty {
+            endpoints.append(endpointAcc)
+        }
+        if let endpoint = group["endpoint"] as? String, !endpoint.isEmpty {
+            endpoints.append(endpoint)
+        }
+        return endpoints
+    }
+
+    private func endpointSignature(from raw: String) -> EndpointSignature? {
+        guard let url = normalizedURL(from: raw), let host = url.host?.lowercased() else {
+            return nil
+        }
+        return EndpointSignature(host: host, path: normalizePath(url.path))
+    }
+
     private func unavailableQuotaData(reason: String) -> ProviderQuotaData {
         ProviderQuotaData(
             models: [
@@ -358,6 +651,70 @@ actor CRSQuotaFetcher {
             ],
             lastUpdated: Date()
         )
+    }
+
+    private func buildRelayKeyQueryTooltip(
+        keyName: String?,
+        groupName: String?,
+        balance: Double?,
+        usedQuota: Double?,
+        totalRequestLimit: Int?,
+        usedRequestCount: Int?,
+        groupBalanceUsed: Double?,
+        groupRequestCount: Int?,
+        groupDailyCost: Double?,
+        groupTotalCost: Double?,
+        groupDailyQuota: Double?,
+        groupTotalCostLimit: Double?
+    ) -> String {
+        var parts: [String] = []
+
+        if let keyName, !keyName.isEmpty {
+            parts.append("Key \(keyName)")
+        }
+
+        if let groupName, !groupName.isEmpty {
+            parts.append("Group \(groupName)")
+        }
+
+        if let balance {
+            if let usedQuota {
+                parts.append("Shared balance \(formatNumber(usedQuota))/\(formatNumber(balance))")
+            } else {
+                parts.append("Shared balance \(formatNumber(balance))")
+            }
+        }
+
+        if let groupBalanceUsed {
+            parts.append("Group balance used \(formatNumber(groupBalanceUsed))")
+        }
+
+        if let groupDailyCost {
+            if let groupDailyQuota, groupDailyQuota > 0 {
+                parts.append("Daily cost \(formatNumber(groupDailyCost))/\(formatNumber(groupDailyQuota))")
+            } else {
+                parts.append("Daily cost \(formatNumber(groupDailyCost))")
+            }
+        }
+
+        if let groupTotalCost {
+            if let groupTotalCostLimit, groupTotalCostLimit > 0 {
+                parts.append("Total cost \(formatNumber(groupTotalCost))/\(formatNumber(groupTotalCostLimit))")
+            } else {
+                parts.append("Total cost \(formatNumber(groupTotalCost))")
+            }
+        }
+
+        if let groupRequestCount {
+            parts.append("Group requests \(formatInteger(groupRequestCount))")
+        }
+
+        if let totalRequestLimit, totalRequestLimit > 0 {
+            let used = usedRequestCount ?? 0
+            parts.append("Key requests \(formatInteger(used))/\(formatInteger(totalRequestLimit))")
+        }
+
+        return parts.joined(separator: " • ")
     }
 
     private func buildTooltip(
