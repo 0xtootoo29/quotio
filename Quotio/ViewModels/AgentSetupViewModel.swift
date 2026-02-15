@@ -404,18 +404,20 @@ final class AgentSetupViewModel {
         do {
             let fetchedModels = try await configurationService.fetchAvailableModels(config: preparedConfig)
             let processedModels = processModels(fetchedModels)
-            self.availableModels = processedModels
+            let mergedModels = await mergeCustomRelayModels(into: processedModels)
+            self.availableModels = mergedModels
             loadedFromRemote = true
 
             // Log model list
-            let modelList = processedModels.map { "\($0.id) (provider: \($0.provider))" }.joined(separator: ", ")
-            logger.debug("[AgentSetupViewModel] Loaded \(processedModels.count) models: \(modelList)")
+            let modelList = mergedModels.map { "\($0.id) (provider: \($0.provider))" }.joined(separator: ", ")
+            logger.debug("[AgentSetupViewModel] Loaded \(mergedModels.count) models: \(modelList)")
         } catch {
             // On error, use default models if list is empty
             logger.error("[AgentSetupViewModel] Failed to load models: \(error.localizedDescription)")
             if availableModels.isEmpty {
-                self.availableModels = AvailableModel.allModels
-                logger.debug("[AgentSetupViewModel] Using \(AvailableModel.allModels.count) default models")
+                let mergedDefaults = await mergeCustomRelayModels(into: AvailableModel.allModels)
+                self.availableModels = mergedDefaults
+                logger.debug("[AgentSetupViewModel] Using \(mergedDefaults.count) default models")
             }
         }
 
@@ -451,6 +453,40 @@ final class AgentSetupViewModel {
         }
 
         return AvailableModel.allModels.sorted { $0.displayName < $1.displayName }
+    }
+
+    private func mergeCustomRelayModels(into models: [AvailableModel]) async -> [AvailableModel] {
+        var merged = models
+        var existing = Set(models.map(\.name))
+
+        let enabledCustomProviders = await MainActor.run {
+            CustomProviderService.shared.providers.filter(\.isEnabled)
+        }
+
+        for provider in enabledCustomProviders {
+            let providerName = provider.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let providerLabel = providerName.isEmpty ? "custom-relay" : providerName
+
+            let mappings = provider.effectiveModelMappingsForExport
+            guard !mappings.isEmpty else { continue }
+
+            for mapping in mappings {
+                let alias = mapping.effectiveAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !alias.isEmpty, !existing.contains(alias) else { continue }
+
+                merged.append(
+                    AvailableModel(
+                        id: alias,
+                        name: alias,
+                        provider: providerLabel,
+                        isDefault: false
+                    )
+                )
+                existing.insert(alias)
+            }
+        }
+
+        return merged.sorted { $0.displayName < $1.displayName }
     }
 
     /// Refresh virtual models - removes old ones and adds current ones

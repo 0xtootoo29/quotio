@@ -358,6 +358,7 @@ extension CustomProvider {
     
     private func generateClaudeCompatibilityYAML() -> String {
         var yaml = ""
+        let effectiveModels = effectiveModelMappingsForExport
         for key in apiKeys {
             yaml += "  - api-key: \"\(key.apiKey)\"\n"
 
@@ -374,9 +375,9 @@ extension CustomProvider {
                 yaml += "    proxy-url: \"\(proxyURL)\"\n"
             }
             
-            if !models.isEmpty {
+            if !effectiveModels.isEmpty {
                 yaml += "    models:\n"
-                for model in models {
+                for model in effectiveModels {
                     yaml += "      - name: \"\(model.name)\"\n"
                     yaml += "        alias: \"\(model.effectiveAlias)\"\n"
                 }
@@ -452,6 +453,77 @@ extension CustomProvider {
     
     private var escapedName: String {
         name.replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    /// Model mappings used when exporting to CLIProxy config.
+    /// For Claude relay providers without explicit mappings, synthesize
+    /// channel aliases so each relay can be selected independently.
+    var effectiveModelMappingsForExport: [ModelMapping] {
+        if !models.isEmpty {
+            return models
+        }
+
+        guard type == .claudeCompatibility else {
+            return []
+        }
+
+        guard let relaySlug = relayChannelSlug else {
+            return []
+        }
+
+        return [
+            ModelMapping(name: "claude-opus-4-6", alias: "\(relaySlug)-opus"),
+            ModelMapping(name: "claude-sonnet-4-5-20250929", alias: "\(relaySlug)-sonnet"),
+            ModelMapping(name: "claude-haiku-4-5-20251001", alias: "\(relaySlug)-haiku")
+        ]
+    }
+
+    /// Best-effort relay channel slug extracted from provider endpoint/name.
+    /// Examples: cc_glm, cc_minimax21, mixedcc
+    private var relayChannelSlug: String? {
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = URL(string: trimmedBaseURL) ?? URL(string: "https://" + trimmedBaseURL) {
+            let pathParts = url.path.split(separator: "/").map(String.init)
+            if let last = pathParts.last, !last.isEmpty {
+                let slug = sanitizeSlug(last)
+                if !isGenericRelayPathSegment(slug) {
+                    return slug
+                }
+            }
+        }
+
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedName.isEmpty {
+            return sanitizeSlug(trimmedName)
+        }
+
+        return nil
+    }
+
+    private func isGenericRelayPathSegment(_ slug: String) -> Bool {
+        switch slug {
+        case "api", "v1", "v2", "v3", "relay", "proxy":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func sanitizeSlug(_ raw: String) -> String {
+        let lowered = raw.lowercased()
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
+        let filteredScalars = lowered.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        let filtered = String(filteredScalars)
+
+        let dedupedDashes = filtered.replacingOccurrences(
+            of: "-+",
+            with: "-",
+            options: .regularExpression
+        )
+        let trimmed = dedupedDashes.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return trimmed.isEmpty ? "relay" : trimmed
     }
 }
 
