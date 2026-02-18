@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 struct DashboardScreen: View {
     @Environment(QuotaViewModel.self) private var viewModel
     @AppStorage("hideGettingStarted") private var hideGettingStarted: Bool = false
+    @AppStorage("dashboard.usage.deduplicateLocalClaude") private var deduplicateLocalClaudeUsage: Bool = true
     @State private var modeManager = OperatingModeManager.shared
 
     @State private var selectedProvider: AIProvider?
@@ -724,7 +725,7 @@ struct DashboardScreen: View {
                             .foregroundStyle(.secondary)
 
                         if usage.models.isEmpty || usage.totalTokens == 0 {
-                            Text("No token usage in this period")
+                            Text("该周期暂无令牌用量")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         } else {
@@ -757,7 +758,7 @@ struct DashboardScreen: View {
                 }
             }
         } label: {
-            Label("Unified Natural Day/Week/Month Tokens", systemImage: "chart.bar.doc.horizontal")
+            Label("统一令牌统计（自然日 / 周 / 月）", systemImage: "chart.bar.doc.horizontal")
         }
     }
 
@@ -795,14 +796,21 @@ struct DashboardScreen: View {
             VStack(alignment: .leading, spacing: 12) {
                 if usageSourceService.sources.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("No external usage sources configured.")
+                        Text("暂未配置外部用量数据源。")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        Text("Add your relay stats URL and token to aggregate cloud-side token usage.")
+                        Text("添加中转统计 URL 与 Token 后，可把云端与本地用量统一汇总。")
                             .font(.caption)
                             .foregroundStyle(.tertiary)
                     }
                 } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle("防重复统计（外部源优先）", isOn: $deduplicateLocalClaudeUsage)
+                        Text("开启后：若已配置外部数据源，将不再把本地 Claude 请求重复计入总额。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     let sortedSources = usageSourceService.sources.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending })
                     ForEach(Array(sortedSources.enumerated()), id: \.element.id) { index, source in
                         usageSourceRow(source)
@@ -813,7 +821,7 @@ struct DashboardScreen: View {
 
                     if viewModel.usageSourceAllTimeTokens > 0 {
                         HStack {
-                            Text("Reported all-time tokens")
+                            Text("外部源累计令牌")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
@@ -827,7 +835,7 @@ struct DashboardScreen: View {
             }
         } label: {
             HStack {
-                Label("External Usage Sources", systemImage: "externaldrive.connected.to.line.below")
+                Label("外部用量数据源", systemImage: "externaldrive.connected.to.line.below")
                 Spacer()
                 if viewModel.isLoadingUsageSources {
                     SmallProgressView()
@@ -838,14 +846,14 @@ struct DashboardScreen: View {
                     Image(systemName: "plus.circle")
                 }
                 .buttonStyle(.plain)
-                .help("Add usage source")
+                .help("新增数据源")
                 Button {
                     Task { await viewModel.refreshUsageSources() }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.plain)
-                .help("Refresh usage sources")
+                .help("刷新数据源")
             }
         }
     }
@@ -892,7 +900,7 @@ struct DashboardScreen: View {
                     Image(systemName: "pencil")
                 }
                 .buttonStyle(.plain)
-                .help("Edit source")
+                .help("编辑数据源")
 
                 Button(role: .destructive) {
                     usageSourceService.deleteSource(id: source.id)
@@ -901,7 +909,7 @@ struct DashboardScreen: View {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.plain)
-                .help("Delete source")
+                .help("删除数据源")
             }
 
             Text(source.statsURL)
@@ -930,7 +938,7 @@ struct DashboardScreen: View {
     private var modelDiscoverySection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                TextField("Base URL (e.g. https://nexus.itssx.com/api/claude_code/cc_glm)", text: $modelDiscoveryBaseURL)
+                TextField("Base URL（示例：https://nexus.itssx.com/api/claude_code/cc_glm）", text: $modelDiscoveryBaseURL)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
 
@@ -944,14 +952,14 @@ struct DashboardScreen: View {
                         if isDiscoveringModels {
                             SmallProgressView()
                         } else {
-                            Label("Discover Models", systemImage: "magnifyingglass")
+                            Label("查询可用模型", systemImage: "magnifyingglass")
                         }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(isDiscoveringModels)
 
                     if !discoveredModels.isEmpty {
-                        Text("\(discoveredModels.count) models")
+                        Text("共 \(discoveredModels.count) 个模型")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -984,7 +992,7 @@ struct DashboardScreen: View {
                 }
             }
         } label: {
-            Label("Model Discovery", systemImage: "shippingbox")
+            Label("模型发现", systemImage: "shippingbox")
         }
     }
 

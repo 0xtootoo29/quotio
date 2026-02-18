@@ -25,7 +25,7 @@ struct UsageSourceSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(isEditing ? "Edit Usage Source" : "Add Usage Source")
+                Text(isEditing ? "编辑用量数据源" : "新增用量数据源")
                     .font(.headline)
                 Spacer()
                 Button {
@@ -44,23 +44,23 @@ struct UsageSourceSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Name")
+                        Text("名称")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        TextField("e.g., Nexus Relay", text: $name)
+                        TextField("例如：Nexus 中转", text: $name)
                             .textFieldStyle(.roundedBorder)
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Stats URL")
+                        Text("统计 URL")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        TextField("https://.../key-query or .../api-stats", text: $statsURL)
+                        TextField("https://.../key-query 或 .../api-stats", text: $statsURL)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(.body, design: .monospaced))
 
                         HStack(spacing: 8) {
-                            Text("Detected Type")
+                            Text("自动识别类型")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text(inferredKind.displayName)
@@ -77,14 +77,14 @@ struct UsageSourceSheet: View {
                         Text("Token / API Key")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        SecureField("Enter token", text: $token)
+                        SecureField("请输入 Token", text: $token)
                             .textFieldStyle(.roundedBorder)
-                        Text("Stored in macOS Keychain")
+                        Text("将安全存储在 macOS 钥匙串")
                             .font(.caption)
                             .foregroundStyle(.tertiary)
                     }
 
-                    Toggle("Enabled", isOn: $isEnabled)
+                    Toggle("启用", isOn: $isEnabled)
 
                     if let validationMessage, !validationMessage.isEmpty {
                         Text(validationMessage)
@@ -98,14 +98,14 @@ struct UsageSourceSheet: View {
             Divider()
 
             HStack {
-                Button("Cancel") {
+                Button("取消") {
                     dismiss()
                 }
                 .keyboardShortcut(.escape)
 
                 Spacer()
 
-                Button(isEditing ? "Save" : "Add") {
+                Button(isEditing ? "保存" : "新增") {
                     save()
                 }
                 .buttonStyle(.borderedProminent)
@@ -147,7 +147,7 @@ struct UsageSourceSheet: View {
         }
 
         if trimmedToken.isEmpty {
-            validationMessage = "Token is required"
+            validationMessage = "Token 不能为空"
             return
         }
 

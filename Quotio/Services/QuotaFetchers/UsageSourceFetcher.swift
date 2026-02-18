@@ -62,7 +62,7 @@ actor UsageSourceFetcher {
                 guard let finalURL = components?.url else { continue }
                 let payload = try await getJSON(url: finalURL, token: token)
                 if let code = intValue(from: payload["code"]), code != 200 {
-                    let message = (payload["msg"] as? String) ?? "Request failed"
+                    let message = (payload["msg"] as? String) ?? "请求失败"
                     throw UsageSourceError.requestFailed(message)
                 }
 
@@ -587,13 +587,13 @@ enum UsageSourceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidURL:
-            return "Invalid stats URL"
+            return "统计 URL 无效"
         case .invalidResponse:
-            return "Invalid stats response"
+            return "统计响应格式无效"
         case .missingToken:
-            return "Token is required"
+            return "Token 不能为空"
         case .missingAPIID:
-            return "Unable to resolve apiId"
+            return "无法解析 apiId"
         case .requestFailed(let message):
             return message
         }

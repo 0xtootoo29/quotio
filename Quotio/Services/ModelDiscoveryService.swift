@@ -102,11 +102,11 @@ enum ModelDiscoveryError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidURL:
-            return "Invalid Base URL"
+            return "Base URL 无效"
         case .invalidResponse:
-            return "Invalid models response"
+            return "模型列表响应格式无效"
         case .missingToken:
-            return "Token is required"
+            return "Token 不能为空"
         case .requestFailed(let message):
             return message
         }

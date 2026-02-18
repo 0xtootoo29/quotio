@@ -253,9 +253,9 @@ nonisolated enum TokenUsagePeriod: String, CaseIterable, Hashable, Sendable {
 
     var title: String {
         switch self {
-        case .day: return "Today"
-        case .week: return "This Week"
-        case .month: return "This Month"
+        case .day: return "今日"
+        case .week: return "本周"
+        case .month: return "本月"
         }
     }
 }

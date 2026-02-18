@@ -39,7 +39,7 @@ final class UsageSourceService {
         }
 
         guard !trimmedToken.isEmpty else {
-            lastError = "Token is required"
+            lastError = "Token 不能为空"
             return
         }
 
@@ -51,7 +51,7 @@ final class UsageSourceService {
 
     func updateSource(_ source: UsageSource, token: String?) {
         guard let index = sources.firstIndex(where: { $0.id == source.id }) else {
-            lastError = "Usage source not found"
+            lastError = "未找到该数据源"
             return
         }
 
@@ -119,7 +119,7 @@ final class UsageSourceService {
             sources = try decoder.decode([UsageSource].self, from: data)
         } catch {
             sources = []
-            lastError = "Failed to load usage sources: \(error.localizedDescription)"
+            lastError = "加载数据源失败：\(error.localizedDescription)"
         }
     }
 
@@ -131,7 +131,7 @@ final class UsageSourceService {
             let data = try encoder.encode(sources)
             UserDefaults.standard.set(data, forKey: storageKey)
         } catch {
-            lastError = "Failed to save usage sources: \(error.localizedDescription)"
+            lastError = "保存数据源失败：\(error.localizedDescription)"
         }
     }
 }

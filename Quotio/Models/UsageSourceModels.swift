@@ -10,11 +10,11 @@ nonisolated enum UsageSourceKind: String, CaseIterable, Codable, Identifiable, S
     var displayName: String {
         switch self {
         case .relayKeyQuery:
-            return "Relay Key Query"
+            return "中转 Key 查询"
         case .relayAPIStats:
-            return "Relay API Stats"
+            return "中转 API 统计"
         case .genericJSON:
-            return "Generic JSON"
+            return "通用 JSON"
         }
     }
 
@@ -65,14 +65,14 @@ nonisolated struct UsageSource: Codable, Identifiable, Hashable, Sendable {
         var errors: [String] = []
 
         if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            errors.append("Name is required")
+            errors.append("名称不能为空")
         }
 
         let trimmedURL = statsURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedURL.isEmpty {
-            errors.append("Stats URL is required")
+            errors.append("统计 URL 不能为空")
         } else if URL(string: trimmedURL) == nil {
-            errors.append("Stats URL is invalid")
+            errors.append("统计 URL 格式无效")
         }
 
         return errors
@@ -127,18 +127,18 @@ nonisolated struct UsageSourceSnapshot: Identifiable, Hashable, Sendable {
 
     var headline: String {
         if let monthTokens {
-            return "M: \(monthTokens.formatted())"
+            return "月：\(monthTokens.formatted())"
         }
         if let weekTokens {
-            return "W: \(weekTokens.formatted())"
+            return "周：\(weekTokens.formatted())"
         }
         if let dayTokens {
-            return "D: \(dayTokens.formatted())"
+            return "日：\(dayTokens.formatted())"
         }
         if let allTimeTokens {
-            return "All: \(allTimeTokens.formatted())"
+            return "累计：\(allTimeTokens.formatted())"
         }
-        return "No token data"
+        return "暂无令牌数据"
     }
 }
 

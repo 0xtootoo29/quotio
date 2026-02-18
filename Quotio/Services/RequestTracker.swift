@@ -149,6 +149,29 @@ final class RequestTracker {
         let cutoff = Date().addingTimeInterval(-Double(minutes * 60))
         return requestHistory.filter { $0.timestamp >= cutoff }
     }
+
+    /// Calculate period token usage while excluding specific providers (case-insensitive).
+    /// Useful for avoiding duplicate counting when an external source already includes the same traffic.
+    func periodTokenUsage(excludingProviders providers: Set<String>) -> [PeriodTokenUsage] {
+        guard !providers.isEmpty else { return periodTokenUsage }
+
+        let normalizedProviders = Set(
+            providers
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        guard !normalizedProviders.isEmpty else { return periodTokenUsage }
+
+        let filteredEntries = requestHistory.filter { entry in
+            let provider = (entry.resolvedProvider ?? entry.provider ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return !normalizedProviders.contains(provider)
+        }
+
+        let filteredStore = RequestHistoryStore(version: RequestHistoryStore.currentVersion, entries: filteredEntries)
+        return filteredStore.calculatePeriodTokenUsage()
+    }
     
     // MARK: - Persistence
     

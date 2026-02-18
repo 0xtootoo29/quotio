@@ -135,8 +135,9 @@ final class QuotaViewModel {
     static let authFilesChangedKey = "quotio.authFiles.lastChanged"
 
     // MARK: - Disabled Auth Files Persistence
-
+    
     private static let disabledAuthFilesKey = "persisted.disabledAuthFiles"
+    private static let usageDeduplicateLocalClaudeKey = "dashboard.usage.deduplicateLocalClaude"
 
     /// Load disabled auth file names from UserDefaults
     private func loadDisabledAuthFiles() -> Set<String> {
@@ -986,8 +987,18 @@ final class QuotaViewModel {
     var totalAccounts: Int { authFiles.count }
     var readyAccounts: Int { authFiles.filter { $0.isReady }.count }
 
+    var deduplicateLocalClaudeUsage: Bool {
+        UserDefaults.standard.object(forKey: Self.usageDeduplicateLocalClaudeKey) as? Bool ?? true
+    }
+
     var unifiedPeriodTokenUsage: [PeriodTokenUsage] {
-        let localUsages = requestTracker.periodTokenUsage
+        let shouldExcludeLocalClaude = deduplicateLocalClaudeUsage && !usageSourceService.enabledSources.isEmpty
+        let localUsages: [PeriodTokenUsage]
+        if shouldExcludeLocalClaude {
+            localUsages = requestTracker.periodTokenUsage(excludingProviders: ["claude", "anthropic"])
+        } else {
+            localUsages = requestTracker.periodTokenUsage
+        }
         let localByPeriod = Dictionary(uniqueKeysWithValues: localUsages.map { ($0.period, $0) })
         let calendar = Calendar.current
         let now = Date()
