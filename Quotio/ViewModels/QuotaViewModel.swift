@@ -46,6 +46,7 @@ final class QuotaViewModel {
     @ObservationIgnored private let traeFetcher = TraeQuotaFetcher()
     @ObservationIgnored private let kiroFetcher = KiroQuotaFetcher()
     @ObservationIgnored private let crsQuotaFetcher = CRSQuotaFetcher()
+    @ObservationIgnored private let usageSourceFetcher = UsageSourceFetcher()
     
     @ObservationIgnored private var lastKnownAccountStatuses: [String: String] = [:]
     @ObservationIgnored private var relayQuotaKeys: Set<String> = []
@@ -88,6 +89,14 @@ final class QuotaViewModel {
     
     /// Subscription info per provider per account (provider -> email -> SubscriptionInfo)
     var subscriptionInfos: [AIProvider: [String: SubscriptionInfo]] = [:]
+
+    /// User-configured external usage sources (relay stats URLs + tokens)
+    let usageSourceService = UsageSourceService.shared
+
+    /// Latest fetched snapshots for usage sources
+    var usageSourceSnapshots: [UUID: UsageSourceSnapshot] = [:]
+    var isLoadingUsageSources = false
+    var usageSourcesLastRefresh: Date?
     
     /// Antigravity account switcher (for IDE token injection)
     let antigravitySwitcher = AntigravityAccountSwitcher.shared
@@ -214,6 +223,7 @@ final class QuotaViewModel {
         await traeFetcher.updateProxyConfiguration()
         await kiroFetcher.updateProxyConfiguration()
         await crsQuotaFetcher.updateProxyConfiguration()
+        await usageSourceFetcher.updateProxyConfiguration()
     }
 
     private func setupRefreshCadenceCallback() {
@@ -365,6 +375,7 @@ final class QuotaViewModel {
         async let kiro: () = refreshKiroQuotasInternal()
 
         _ = await (antigravity, openai, copilot, claudeCode, codexCLI, geminiCLI, glm, warp, kiro)
+        await refreshUsageSources()
         
         checkQuotaNotifications()
         pruneMenuBarItems()
@@ -974,6 +985,115 @@ final class QuotaViewModel {
     
     var totalAccounts: Int { authFiles.count }
     var readyAccounts: Int { authFiles.filter { $0.isReady }.count }
+
+    var unifiedPeriodTokenUsage: [PeriodTokenUsage] {
+        let localUsages = requestTracker.periodTokenUsage
+        let localByPeriod = Dictionary(uniqueKeysWithValues: localUsages.map { ($0.period, $0) })
+        let calendar = Calendar.current
+        let now = Date()
+
+        return TokenUsagePeriod.allCases.compactMap { period in
+            let local = localByPeriod[period]
+            guard let interval = calendar.dateInterval(
+                of: period == .day ? .day : (period == .week ? .weekOfYear : .month),
+                for: now
+            ) else {
+                return local
+            }
+
+            var modelBuckets: [String: (tokens: Int, requests: Int)] = [:]
+
+            if let local {
+                for model in local.models {
+                    modelBuckets[model.model] = (model.tokenCount, model.requestCount)
+                }
+            }
+
+            let externalTokens = usageSourceSnapshots.values.reduce(0) { partial, snapshot in
+                partial + (snapshot.tokens(for: period) ?? 0)
+            }
+            let externalRequests = usageSourceSnapshots.values.reduce(0) { partial, snapshot in
+                partial + snapshot.models(for: period).reduce(0) { $0 + $1.requestCount }
+            }
+
+            for snapshot in usageSourceSnapshots.values {
+                for model in snapshot.models(for: period) {
+                    let existing = modelBuckets[model.model] ?? (0, 0)
+                    modelBuckets[model.model] = (
+                        tokens: existing.tokens + model.tokenCount,
+                        requests: existing.requests + model.requestCount
+                    )
+                }
+            }
+
+            let mergedModels = modelBuckets
+                .map { key, value in
+                    ModelTokenUsage(
+                        id: key,
+                        model: key,
+                        tokenCount: value.tokens,
+                        requestCount: value.requests
+                    )
+                }
+                .filter { $0.tokenCount > 0 }
+                .sorted { lhs, rhs in
+                    if lhs.tokenCount == rhs.tokenCount {
+                        return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
+                    }
+                    return lhs.tokenCount > rhs.tokenCount
+                }
+
+            let totalTokens = (local?.totalTokens ?? 0) + externalTokens
+            let totalRequests = (local?.totalRequests ?? 0) + externalRequests
+
+            return PeriodTokenUsage(
+                period: period,
+                startDate: interval.start,
+                endDate: interval.end,
+                totalTokens: totalTokens,
+                totalRequests: totalRequests,
+                models: mergedModels
+            )
+        }
+    }
+
+    var usageSourceAllTimeTokens: Int {
+        usageSourceSnapshots.values.reduce(0) { $0 + ($1.allTimeTokens ?? 0) }
+    }
+
+    func refreshUsageSources() async {
+        guard !isLoadingUsageSources else { return }
+
+        let enabledSources = usageSourceService.enabledSources
+        guard !enabledSources.isEmpty else {
+            usageSourceSnapshots = [:]
+            usageSourcesLastRefresh = Date()
+            return
+        }
+
+        isLoadingUsageSources = true
+        defer {
+            isLoadingUsageSources = false
+            usageSourcesLastRefresh = Date()
+        }
+
+        let fetched: [UsageSourceSnapshot] = await withTaskGroup(of: UsageSourceSnapshot.self) { group in
+            for source in enabledSources {
+                let token = usageSourceService.token(for: source.id)
+                group.addTask { [usageSourceFetcher] in
+                    await usageSourceFetcher.fetchSnapshot(for: source, token: token)
+                }
+            }
+
+            var snapshots: [UsageSourceSnapshot] = []
+            for await snapshot in group {
+                snapshots.append(snapshot)
+            }
+            return snapshots
+        }
+
+        usageSourceSnapshots = Dictionary(uniqueKeysWithValues: fetched.map { ($0.sourceID, $0) })
+    }
     
     func startProxy() async {
         guard !isStartingProxyFlow else { return }
@@ -1195,6 +1315,8 @@ final class QuotaViewModel {
             _ = await (antigravity, openai, copilot, claudeCode, glm, warp, kiro)
         }
 
+        await refreshUsageSources()
+
         checkQuotaNotifications()
         pruneMenuBarItems()
         autoSelectMenuBarItems()
@@ -1234,6 +1356,8 @@ final class QuotaViewModel {
         } else {
             _ = await (antigravity, openai, copilot, claudeCode, glm, warp, kiro)
         }
+
+        await refreshUsageSources()
 
         checkQuotaNotifications()
         pruneMenuBarItems()

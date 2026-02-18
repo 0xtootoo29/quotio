@@ -14,6 +14,7 @@ enum KeychainHelper {
     private static let remoteService = "dev.quotio.desktop.remote-management"
     private static let localService = "dev.quotio.desktop.local-management"
     private static let warpService = "dev.quotio.desktop.warp"
+    private static let usageSourceService = "dev.quotio.desktop.usage-sources"
     private static let localManagementAccount = "local-management-key"
     private static let warpTokensAccount = "warp-tokens"
     private static let localManagementDefaultsKey = "managementKey"
@@ -134,6 +135,26 @@ enum KeychainHelper {
             deleteData(service: legacy, account: warpTokensAccount)
         }
         UserDefaults.standard.removeObject(forKey: warpTokensDefaultsKey)
+    }
+
+    static func saveUsageSourceToken(_ token: String, for sourceID: UUID) -> Bool {
+        guard let data = token.data(using: .utf8) else { return false }
+        let account = "usage-source-token-\(sourceID.uuidString)"
+        let saved = saveData(data, service: usageSourceService, account: account)
+        if !saved {
+            Log.keychain("Failed to save usage source token for \(sourceID.uuidString)")
+        }
+        return saved
+    }
+
+    static func getUsageSourceToken(for sourceID: UUID) -> String? {
+        let account = "usage-source-token-\(sourceID.uuidString)"
+        return readString(service: usageSourceService, account: account)
+    }
+
+    static func deleteUsageSourceToken(for sourceID: UUID) {
+        let account = "usage-source-token-\(sourceID.uuidString)"
+        deleteData(service: usageSourceService, account: account)
     }
 
     private static func migrateData(from oldServices: [String], to newService: String, account: String) -> Data? {

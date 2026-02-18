@@ -17,8 +17,16 @@ struct DashboardScreen: View {
     @State private var selectedAgentForConfig: CLIAgent?
     @State private var sheetPresentationID = UUID()
     @State private var showTunnelSheet = false
+    @State private var usageSourceService = UsageSourceService.shared
+    @State private var usageSourceSheetMode: UsageSourceSheetMode?
+    @State private var modelDiscoveryBaseURL: String = ""
+    @State private var modelDiscoveryToken: String = ""
+    @State private var discoveredModels: [DiscoveredModel] = []
+    @State private var modelDiscoveryError: String?
+    @State private var isDiscoveringModels = false
     
     private var tunnelManager: TunnelManager { TunnelManager.shared }
+    private let modelDiscoveryService = ModelDiscoveryService()
 
     private static let periodDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -79,7 +87,7 @@ struct DashboardScreen: View {
     }
 
     private var periodTokenUsage: [PeriodTokenUsage] {
-        viewModel.requestTracker.periodTokenUsage
+        viewModel.unifiedPeriodTokenUsage
     }
     
     var body: some View {
@@ -138,6 +146,28 @@ struct DashboardScreen: View {
                     Task { await viewModel.agentSetupViewModel.refreshAgentStatuses() }
                 }
         }
+        .sheet(item: $usageSourceSheetMode) { mode in
+            UsageSourceSheet(
+                source: mode.source,
+                initialToken: mode.source.flatMap { usageSourceService.token(for: $0.id) } ?? ""
+            ) { source, token in
+                switch mode {
+                case .add:
+                    usageSourceService.addSource(
+                        name: source.name,
+                        statsURL: source.statsURL,
+                        token: token,
+                        isEnabled: source.isEnabled
+                    )
+                case .edit:
+                    usageSourceService.updateSource(source, token: token)
+                }
+
+                Task {
+                    await viewModel.refreshUsageSources()
+                }
+            }
+        }
         .fileImporter(
             isPresented: $isImporterPresented,
             allowedContentTypes: [.json],
@@ -154,6 +184,7 @@ struct DashboardScreen: View {
             if modeManager.isLocalProxyMode {
                 await viewModel.agentSetupViewModel.refreshAgentStatuses()
             }
+            await viewModel.refreshUsageSources()
         }
     }
     
@@ -167,6 +198,8 @@ struct DashboardScreen: View {
             
             kpiSection
             periodTokenUsageSection
+            usageSourcesSection
+            modelDiscoverySection
             providerSection
             endpointSection
             tunnelSection
@@ -182,6 +215,9 @@ struct DashboardScreen: View {
             
             // Quick Quota Status
             quotaStatusSection
+
+            usageSourcesSection
+            modelDiscoverySection
             
             // Tracked Accounts
             trackedAccountsSection
@@ -721,7 +757,7 @@ struct DashboardScreen: View {
                 }
             }
         } label: {
-            Label("Natural Day/Week/Month Tokens", systemImage: "chart.bar.doc.horizontal")
+            Label("Unified Natural Day/Week/Month Tokens", systemImage: "chart.bar.doc.horizontal")
         }
     }
 
@@ -750,6 +786,223 @@ struct DashboardScreen: View {
         let start = Self.periodDateFormatter.string(from: usage.startDate)
         let end = Self.periodDateFormatter.string(from: inclusiveEnd)
         return "\(start) - \(end)"
+    }
+
+    // MARK: - Usage Sources
+
+    private var usageSourcesSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                if usageSourceService.sources.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No external usage sources configured.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Text("Add your relay stats URL and token to aggregate cloud-side token usage.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                } else {
+                    let sortedSources = usageSourceService.sources.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending })
+                    ForEach(Array(sortedSources.enumerated()), id: \.element.id) { index, source in
+                        usageSourceRow(source)
+                        if index < sortedSources.count - 1 {
+                            Divider()
+                        }
+                    }
+
+                    if viewModel.usageSourceAllTimeTokens > 0 {
+                        HStack {
+                            Text("Reported all-time tokens")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(viewModel.usageSourceAllTimeTokens.formattedCompact)
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                        }
+                        .padding(.top, 4)
+                    }
+                }
+            }
+        } label: {
+            HStack {
+                Label("External Usage Sources", systemImage: "externaldrive.connected.to.line.below")
+                Spacer()
+                if viewModel.isLoadingUsageSources {
+                    SmallProgressView()
+                }
+                Button {
+                    usageSourceSheetMode = .add
+                } label: {
+                    Image(systemName: "plus.circle")
+                }
+                .buttonStyle(.plain)
+                .help("Add usage source")
+                Button {
+                    Task { await viewModel.refreshUsageSources() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .help("Refresh usage sources")
+            }
+        }
+    }
+
+    private func usageSourceRow(_ source: UsageSource) -> some View {
+        let snapshot = viewModel.usageSourceSnapshots[source.id]
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(snapshot?.isHealthy == false ? Color.red : Color.green)
+                    .frame(width: 7, height: 7)
+
+                Text(source.name)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+
+                Text(source.kind.displayName)
+                    .font(.caption2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.08))
+                    .clipShape(Capsule())
+
+                Spacer()
+
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { source.isEnabled },
+                        set: { _ in
+                            usageSourceService.toggleSource(id: source.id)
+                            Task { await viewModel.refreshUsageSources() }
+                        }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .frame(width: 32)
+
+                Button {
+                    usageSourceSheetMode = .edit(source)
+                } label: {
+                    Image(systemName: "pencil")
+                }
+                .buttonStyle(.plain)
+                .help("Edit source")
+
+                Button(role: .destructive) {
+                    usageSourceService.deleteSource(id: source.id)
+                    Task { await viewModel.refreshUsageSources() }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.plain)
+                .help("Delete source")
+            }
+
+            Text(source.statsURL)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            if let snapshot {
+                Text(snapshot.headline)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if let status = snapshot.statusMessage, !status.isEmpty {
+                    Text(status)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                }
+            }
+        }
+    }
+
+    // MARK: - Model Discovery
+
+    private var modelDiscoverySection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Base URL (e.g. https://nexus.itssx.com/api/claude_code/cc_glm)", text: $modelDiscoveryBaseURL)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+
+                SecureField("Token / API Key", text: $modelDiscoveryToken)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    Button {
+                        Task { await discoverModels() }
+                    } label: {
+                        if isDiscoveringModels {
+                            SmallProgressView()
+                        } else {
+                            Label("Discover Models", systemImage: "magnifyingglass")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isDiscoveringModels)
+
+                    if !discoveredModels.isEmpty {
+                        Text("\(discoveredModels.count) models")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let modelDiscoveryError, !modelDiscoveryError.isEmpty {
+                    Text(modelDiscoveryError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                if !discoveredModels.isEmpty {
+                    Divider()
+                    ForEach(discoveredModels.prefix(30)) { model in
+                        HStack(spacing: 8) {
+                            Text(model.id)
+                                .font(.caption)
+                                .fontWeight(.medium)
+                                .textSelection(.enabled)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            if let provider = model.provider, !provider.isEmpty {
+                                Text(provider)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            Label("Model Discovery", systemImage: "shippingbox")
+        }
+    }
+
+    private func discoverModels() async {
+        isDiscoveringModels = true
+        defer { isDiscoveringModels = false }
+
+        modelDiscoveryError = nil
+        discoveredModels = []
+
+        do {
+            discoveredModels = try await modelDiscoveryService.fetchModels(
+                baseURL: modelDiscoveryBaseURL,
+                token: modelDiscoveryToken
+            )
+        } catch {
+            modelDiscoveryError = error.localizedDescription
+        }
     }
     
     // MARK: - Provider Section
@@ -990,6 +1243,29 @@ struct KPICard: View {
         } label: {
             Label(title, systemImage: icon)
                 .foregroundStyle(color)
+        }
+    }
+}
+
+private enum UsageSourceSheetMode: Identifiable {
+    case add
+    case edit(UsageSource)
+
+    var id: String {
+        switch self {
+        case .add:
+            return "add"
+        case .edit(let source):
+            return "edit-\(source.id.uuidString)"
+        }
+    }
+
+    var source: UsageSource? {
+        switch self {
+        case .add:
+            return nil
+        case .edit(let source):
+            return source
         }
     }
 }
