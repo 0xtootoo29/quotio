@@ -266,6 +266,8 @@ final class QuotaViewModel {
     // MARK: - Mode-Aware Initialization
     
     func initialize() async {
+        _ = await RelayModelCatalogService.shared.scanConfiguredProviders(force: false)
+
         if modeManager.isRemoteProxyMode {
             await initializeRemoteMode()
         } else if modeManager.isMonitorMode {
@@ -992,7 +994,8 @@ final class QuotaViewModel {
     }
 
     var unifiedPeriodTokenUsage: [PeriodTokenUsage] {
-        let shouldExcludeLocalClaude = deduplicateLocalClaudeUsage && !usageSourceService.enabledSources.isEmpty
+        let hasHealthyExternalSource = usageSourceSnapshots.values.contains { $0.isHealthy }
+        let shouldExcludeLocalClaude = deduplicateLocalClaudeUsage && hasHealthyExternalSource
         let localUsages: [PeriodTokenUsage]
         if shouldExcludeLocalClaude {
             localUsages = requestTracker.periodTokenUsage(excludingProviders: ["claude", "anthropic"])

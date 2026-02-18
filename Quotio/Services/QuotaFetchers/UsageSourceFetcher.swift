@@ -90,43 +90,53 @@ actor UsageSourceFetcher {
     }
 
     private func fetchRelayAPIStatsSnapshot(source: UsageSource, token: String?) async throws -> UsageSourceSnapshot {
-        guard let base = normalizedBaseURL(from: source.statsURL) else {
+        let baseCandidates = relayAPIStatsBaseCandidates(from: source.statsURL)
+        guard !baseCandidates.isEmpty else {
             throw UsageSourceError.invalidURL
         }
 
-        let apiID = try await resolveAPIID(statsURL: source.statsURL, baseURL: base, token: token)
+        var lastError: Error = UsageSourceError.invalidResponse
+        for base in baseCandidates {
+            do {
+                let apiID = try await resolveAPIID(statsURL: source.statsURL, baseURL: base, token: token)
 
-        let statsEndpoints = [
-            base + "/apiStats/api/user-stats",
-            base + "/api/apiStats/api/user-stats"
-        ]
-        let modelEndpoints = [
-            base + "/apiStats/api/user-model-stats",
-            base + "/api/apiStats/api/user-model-stats"
-        ]
+                let statsEndpoints = [
+                    base + "/apiStats/api/user-stats",
+                    base + "/api/apiStats/api/user-stats"
+                ]
+                let modelEndpoints = [
+                    base + "/apiStats/api/user-model-stats",
+                    base + "/api/apiStats/api/user-model-stats"
+                ]
 
-        let statsPayload = try await fetchJSONWithFallback(endpoints: statsEndpoints, body: ["apiId": apiID], token: token) ?? [:]
-        let modelPayload = try await fetchJSONWithFallback(endpoints: modelEndpoints, body: ["apiId": apiID], token: token, allowFailure: true)
+                let statsPayload = try await fetchJSONWithFallback(endpoints: statsEndpoints, body: ["apiId": apiID], token: token) ?? [:]
+                let modelPayload = try await fetchJSONWithFallback(endpoints: modelEndpoints, body: ["apiId": apiID], token: token, allowFailure: true)
 
-        let periodTokens = extractPeriodTokens(from: statsPayload)
-        var modelsByPeriod = extractModelUsageByPeriod(from: modelPayload ?? [:])
+                let periodTokens = extractPeriodTokens(from: statsPayload)
+                var modelsByPeriod = extractModelUsageByPeriod(from: modelPayload ?? [:])
 
-        // Fallback: if model payload has no model period data, try extracting from stats payload.
-        if modelsByPeriod.isEmpty {
-            modelsByPeriod = extractModelUsageByPeriod(from: statsPayload)
+                // Fallback: if model payload has no model period data, try extracting from stats payload.
+                if modelsByPeriod.isEmpty {
+                    modelsByPeriod = extractModelUsageByPeriod(from: statsPayload)
+                }
+
+                return UsageSourceSnapshot(
+                    sourceID: source.id,
+                    sourceName: source.name,
+                    fetchedAt: Date(),
+                    allTimeTokens: periodTokens.allTime,
+                    dayTokens: periodTokens.day,
+                    weekTokens: periodTokens.week,
+                    monthTokens: periodTokens.month,
+                    modelsByPeriod: modelsByPeriod,
+                    statusMessage: summaryMessage(from: statsPayload)
+                )
+            } catch {
+                lastError = error
+            }
         }
 
-        return UsageSourceSnapshot(
-            sourceID: source.id,
-            sourceName: source.name,
-            fetchedAt: Date(),
-            allTimeTokens: periodTokens.allTime,
-            dayTokens: periodTokens.day,
-            weekTokens: periodTokens.week,
-            monthTokens: periodTokens.month,
-            modelsByPeriod: modelsByPeriod,
-            statusMessage: nil
-        )
+        throw lastError
     }
 
     private func fetchGenericSnapshot(source: UsageSource, token: String?) async throws -> UsageSourceSnapshot {
@@ -204,6 +214,14 @@ actor UsageSourceFetcher {
 
             do {
                 let payload = try await postJSON(url: url, body: body, token: token)
+                if let success = payload["success"] as? Bool, !success {
+                    let message = extractAPIError(from: payload) ?? "请求失败"
+                    throw UsageSourceError.requestFailed(message)
+                }
+                if let code = intValue(from: payload["code"]), code != 0, code != 200 {
+                    let message = extractAPIError(from: payload) ?? "请求失败"
+                    throw UsageSourceError.requestFailed(message)
+                }
                 if let error = extractAPIError(from: payload) {
                     throw UsageSourceError.requestFailed(error)
                 }
@@ -217,6 +235,14 @@ actor UsageSourceFetcher {
                         components?.queryItems = body.map { URLQueryItem(name: $0.key, value: String(describing: $0.value)) }
                         guard let getURL = components?.url else { continue }
                         let payload = try await getJSON(url: getURL, token: token)
+                        if let success = payload["success"] as? Bool, !success {
+                            let message = extractAPIError(from: payload) ?? "请求失败"
+                            throw UsageSourceError.requestFailed(message)
+                        }
+                        if let code = intValue(from: payload["code"]), code != 0, code != 200 {
+                            let message = extractAPIError(from: payload) ?? "请求失败"
+                            throw UsageSourceError.requestFailed(message)
+                        }
                         if let error = extractAPIError(from: payload) {
                             throw UsageSourceError.requestFailed(error)
                         }
@@ -306,6 +332,12 @@ actor UsageSourceFetcher {
         if let message = payload["message"] as? String, !message.isEmpty {
             return message
         }
+        if let msgObject = payload["msg"] as? [String: Any],
+           let error = msgObject["error"] as? [String: Any],
+           let message = error["message"] as? String,
+           !message.isEmpty {
+            return message
+        }
         if let msg = payload["msg"] as? String, !msg.isEmpty, msg.lowercased() != "ok" {
             return msg
         }
@@ -321,6 +353,9 @@ actor UsageSourceFetcher {
     }
 
     private func summaryMessage(from payload: [String: Any]) -> String? {
+        if let success = payload["success"] as? Bool, !success {
+            return extractAPIError(from: payload) ?? "请求失败"
+        }
         if let msg = payload["msg"] as? String, !msg.isEmpty, msg.lowercased() != "ok" {
             return msg
         }
@@ -332,24 +367,43 @@ actor UsageSourceFetcher {
 
         // Fast-path for common layouts.
         let usage = (data["usage"] as? [String: Any]) ?? payload["usage"] as? [String: Any]
-        var allTime = intValue(from: nestedValue(in: usage, path: ["total", "tokens"]))
+        let stats = data["stats"] as? [String: Any]
+
+        var allTime = tokenCount(from: nestedValue(in: usage, path: ["total"]) as? [String: Any])
+        if allTime == nil { allTime = intValue(from: nestedValue(in: usage, path: ["total", "tokens"])) }
+        if allTime == nil { allTime = intValue(from: nestedValue(in: usage, path: ["total", "allTokens"])) }
+        if allTime == nil { allTime = tokenCount(from: stats?["total"] as? [String: Any]) }
         if allTime == nil { allTime = intValue(from: data["totalTokens"]) }
         if allTime == nil { allTime = intValue(from: data["tokens"]) }
+        if allTime == nil { allTime = intValue(from: data["allTokens"]) }
 
-        var day = intValue(from: nestedValue(in: usage, path: ["day", "tokens"]))
+        var day = tokenCount(from: nestedValue(in: usage, path: ["day"]) as? [String: Any])
+        if day == nil { day = intValue(from: nestedValue(in: usage, path: ["day", "tokens"])) }
+        if day == nil { day = intValue(from: nestedValue(in: usage, path: ["day", "allTokens"])) }
+        if day == nil { day = tokenCount(from: stats?["day"] as? [String: Any]) }
         if day == nil { day = intValue(from: nestedValue(in: usage, path: ["daily", "tokens"])) }
+        if day == nil { day = intValue(from: nestedValue(in: usage, path: ["daily", "allTokens"])) }
         if day == nil { day = intValue(from: nestedValue(in: usage, path: ["today", "tokens"])) }
+        if day == nil { day = intValue(from: nestedValue(in: usage, path: ["today", "allTokens"])) }
         if day == nil { day = intValue(from: data["dayTokens"]) }
         if day == nil { day = intValue(from: data["dailyTokens"]) }
         if day == nil { day = intValue(from: data["todayTokens"]) }
 
-        var week = intValue(from: nestedValue(in: usage, path: ["week", "tokens"]))
+        var week = tokenCount(from: nestedValue(in: usage, path: ["week"]) as? [String: Any])
+        if week == nil { week = intValue(from: nestedValue(in: usage, path: ["week", "tokens"])) }
+        if week == nil { week = intValue(from: nestedValue(in: usage, path: ["week", "allTokens"])) }
+        if week == nil { week = tokenCount(from: stats?["week"] as? [String: Any]) }
         if week == nil { week = intValue(from: nestedValue(in: usage, path: ["weekly", "tokens"])) }
+        if week == nil { week = intValue(from: nestedValue(in: usage, path: ["weekly", "allTokens"])) }
         if week == nil { week = intValue(from: data["weekTokens"]) }
         if week == nil { week = intValue(from: data["weeklyTokens"]) }
 
-        var month = intValue(from: nestedValue(in: usage, path: ["month", "tokens"]))
+        var month = tokenCount(from: nestedValue(in: usage, path: ["month"]) as? [String: Any])
+        if month == nil { month = intValue(from: nestedValue(in: usage, path: ["month", "tokens"])) }
+        if month == nil { month = intValue(from: nestedValue(in: usage, path: ["month", "allTokens"])) }
+        if month == nil { month = tokenCount(from: stats?["month"] as? [String: Any]) }
         if month == nil { month = intValue(from: nestedValue(in: usage, path: ["monthly", "tokens"])) }
+        if month == nil { month = intValue(from: nestedValue(in: usage, path: ["monthly", "allTokens"])) }
         if month == nil { month = intValue(from: data["monthTokens"]) }
         if month == nil { month = intValue(from: data["monthlyTokens"]) }
 
@@ -357,20 +411,20 @@ actor UsageSourceFetcher {
         let flat = flattenJSON(data)
         var fallbackDay = day
         if fallbackDay == nil {
-            fallbackDay = firstMatchingInt(from: flat, patterns: ["day.tokens", "daily.tokens", "today.tokens", "daytokens", "dailytokens", "todaytokens"])
+            fallbackDay = firstMatchingInt(from: flat, patterns: ["day.tokens", "day.alltokens", "daily.tokens", "today.tokens", "daytokens", "dailytokens", "todaytokens"])
         }
         var fallbackWeek = week
         if fallbackWeek == nil {
-            fallbackWeek = firstMatchingInt(from: flat, patterns: ["week.tokens", "weekly.tokens", "weektokens", "weeklytokens"])
+            fallbackWeek = firstMatchingInt(from: flat, patterns: ["week.tokens", "week.alltokens", "weekly.tokens", "weektokens", "weeklytokens"])
         }
         var fallbackMonth = month
         if fallbackMonth == nil {
-            fallbackMonth = firstMatchingInt(from: flat, patterns: ["month.tokens", "monthly.tokens", "monthtokens", "monthlytokens"])
+            fallbackMonth = firstMatchingInt(from: flat, patterns: ["month.tokens", "month.alltokens", "monthly.tokens", "monthtokens", "monthlytokens"])
         }
 
         var fallbackAll = allTime
         if fallbackAll == nil {
-            fallbackAll = firstMatchingInt(from: flat, patterns: ["total.tokens", "all.tokens", "alltime.tokens", "totaltokens", "alltokens", "alltimetokens"])
+            fallbackAll = firstMatchingInt(from: flat, patterns: ["total.tokens", "total.alltokens", "all.tokens", "alltime.tokens", "totaltokens", "alltokens", "alltimetokens"])
         }
 
         return (fallbackAll, fallbackDay, fallbackWeek, fallbackMonth)
@@ -378,12 +432,23 @@ actor UsageSourceFetcher {
 
     private func extractModelUsageByPeriod(from payload: [String: Any]) -> [TokenUsagePeriod: [SourceModelUsage]] {
         var periodBuckets: [TokenUsagePeriod: [String: (tokens: Int, requests: Int)]] = [:]
+        let data = (payload["data"] as? [String: Any]) ?? payload
+
+        let periodModelDictionaryCandidates: [[String: Any]] = [
+            data["modelStats"] as? [String: Any],
+            payload["modelStats"] as? [String: Any],
+            data["models"] as? [String: Any]
+        ].compactMap { $0 }
+
+        for candidate in periodModelDictionaryCandidates {
+            ingestPeriodModelDictionary(candidate, into: &periodBuckets)
+        }
 
         let arraysToCheck: [[Any]] = [
             payload["data"] as? [Any],
             payload["models"] as? [Any],
-            (payload["data"] as? [String: Any])?["models"] as? [Any],
-            (payload["data"] as? [String: Any])?["list"] as? [Any]
+            data["models"] as? [Any],
+            data["list"] as? [Any]
         ].compactMap { $0 }
 
         for array in arraysToCheck {
@@ -397,6 +462,7 @@ actor UsageSourceFetcher {
                     requests = intValue(from: dictionary["requestCount"])
                 }
                 let requestCount = requests ?? 0
+                let aggregateTokens = tokenCount(from: dictionary)
 
                 if let day = tokens.day, day > 0 {
                     mergeModelUsage(modelName: modelName, tokens: day, requests: requestCount, period: .day, buckets: &periodBuckets)
@@ -406,6 +472,10 @@ actor UsageSourceFetcher {
                 }
                 if let month = tokens.month, month > 0 {
                     mergeModelUsage(modelName: modelName, tokens: month, requests: requestCount, period: .month, buckets: &periodBuckets)
+                }
+                if tokens.day == nil, tokens.week == nil, tokens.month == nil,
+                   let aggregateTokens, aggregateTokens > 0 {
+                    mergeModelUsage(modelName: modelName, tokens: aggregateTokens, requests: requestCount, period: .month, buckets: &periodBuckets)
                 }
             }
         }
@@ -420,6 +490,83 @@ actor UsageSourceFetcher {
                     return lhs.tokenCount > rhs.tokenCount
                 }
         }
+    }
+
+    private func ingestPeriodModelDictionary(
+        _ periodDictionary: [String: Any],
+        into buckets: inout [TokenUsagePeriod: [String: (tokens: Int, requests: Int)]]
+    ) {
+        let mapping: [(String, TokenUsagePeriod)] = [
+            ("day", .day),
+            ("today", .day),
+            ("week", .week),
+            ("weekly", .week),
+            ("monthly", .month),
+            ("month", .month)
+        ]
+
+        for (key, period) in mapping {
+            guard let modelMap = periodDictionary[key] as? [String: Any] else { continue }
+            ingestModelMap(modelMap, period: period, into: &buckets)
+        }
+    }
+
+    private func ingestModelMap(
+        _ modelMap: [String: Any],
+        period: TokenUsagePeriod,
+        into buckets: inout [TokenUsagePeriod: [String: (tokens: Int, requests: Int)]]
+    ) {
+        for (modelName, rawValue) in modelMap {
+            guard !modelName.isEmpty else { continue }
+            guard let dictionary = rawValue as? [String: Any] else { continue }
+            guard let tokens = tokenCount(from: dictionary), tokens > 0 else { continue }
+
+            var requests = intValue(from: dictionary["requests"])
+            if requests == nil {
+                requests = intValue(from: dictionary["requestCount"])
+            }
+
+            mergeModelUsage(
+                modelName: modelName,
+                tokens: tokens,
+                requests: requests ?? 0,
+                period: period,
+                buckets: &buckets
+            )
+        }
+    }
+
+    private func tokenCount(from dictionary: [String: Any]?) -> Int? {
+        guard let dictionary else { return nil }
+
+        if let allTokens = intValue(from: dictionary["allTokens"]) {
+            return allTokens
+        }
+        if let tokens = intValue(from: dictionary["tokens"]) {
+            return tokens
+        }
+        if let totalTokens = intValue(from: dictionary["totalTokens"]) {
+            return totalTokens
+        }
+
+        let components = [
+            "inputTokens",
+            "outputTokens",
+            "reasoningTokens",
+            "cacheWriteTokens",
+            "cacheReadTokens",
+            "cacheCreateTokens"
+        ]
+
+        var sum = 0
+        var found = false
+        for key in components {
+            guard let value = intValue(from: dictionary[key]) else { continue }
+            sum += value
+            found = true
+        }
+
+        return found ? sum : nil
     }
 
     private func mergeModelUsage(
@@ -543,6 +690,51 @@ actor UsageSourceFetcher {
             return "\(scheme)://\(host):\(port)"
         }
         return "\(scheme)://\(host)"
+    }
+
+    private func relayAPIStatsBaseCandidates(from statsURL: String) -> [String] {
+        guard let url = normalizedURL(from: statsURL),
+              let host = url.host?.lowercased(),
+              let base = normalizedBaseURL(from: statsURL) else {
+            return []
+        }
+
+        var candidates: [String] = [base]
+        let scheme = url.scheme ?? "https"
+        let portSuffix = url.port.map { ":\($0)" } ?? ""
+
+        // Known panel host -> API host mapping.
+        if host == "crs2.itssx.com" {
+            candidates.append("\(scheme)://crs2acc.itssx.com\(portSuffix)")
+        }
+
+        // Generic fallback: foo.example.com -> fooacc.example.com
+        if let accHost = accHostVariant(from: host) {
+            candidates.append("\(scheme)://\(accHost)\(portSuffix)")
+        }
+
+        var deduped: [String] = []
+        var seen = Set<String>()
+        for candidate in candidates {
+            guard let normalized = normalizedBaseURL(from: candidate) else { continue }
+            if seen.insert(normalized).inserted {
+                deduped.append(normalized)
+            }
+        }
+
+        return deduped
+    }
+
+    private func accHostVariant(from host: String) -> String? {
+        let parts = host.split(separator: ".")
+        guard !parts.isEmpty else { return nil }
+
+        let first = String(parts[0])
+        guard !first.hasSuffix("acc") else { return nil }
+
+        var updatedParts = parts
+        updatedParts[0] = Substring(first + "acc")
+        return updatedParts.map(String.init).joined(separator: ".")
     }
 
     private func relayKeyQueryCandidates(from statsURL: String) -> [URL] {

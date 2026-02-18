@@ -20,7 +20,16 @@ nonisolated enum UsageSourceKind: String, CaseIterable, Codable, Identifiable, S
 
     static func inferred(from statsURL: String) -> UsageSourceKind {
         let lowered = statsURL.lowercased()
+        if lowered.contains("nexusacc.itssx.com") {
+            return .relayKeyQuery
+        }
+        if lowered.contains("crs2.itssx.com") || lowered.contains("crs2acc.itssx.com") {
+            return .relayAPIStats
+        }
         if lowered.contains("/admin-next/api-stats") || lowered.contains("api-stats") || lowered.contains("/apistats/") {
+            return .relayAPIStats
+        }
+        if lowered.hasSuffix("/api") {
             return .relayAPIStats
         }
         if lowered.contains("key-query") || lowered.contains("relay/key-query") {

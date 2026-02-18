@@ -19,12 +19,14 @@ struct DashboardScreen: View {
     @State private var sheetPresentationID = UUID()
     @State private var showTunnelSheet = false
     @State private var usageSourceService = UsageSourceService.shared
+    @State private var relayModelCatalogService = RelayModelCatalogService.shared
     @State private var usageSourceSheetMode: UsageSourceSheetMode?
     @State private var modelDiscoveryBaseURL: String = ""
     @State private var modelDiscoveryToken: String = ""
     @State private var discoveredModels: [DiscoveredModel] = []
     @State private var modelDiscoveryError: String?
     @State private var isDiscoveringModels = false
+    @State private var modelAutoScanStatus: String?
     
     private var tunnelManager: TunnelManager { TunnelManager.shared }
     private let modelDiscoveryService = ModelDiscoveryService()
@@ -33,6 +35,13 @@ struct DashboardScreen: View {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
+        return formatter
+    }()
+
+    private static let dateTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
         return formatter
     }()
     
@@ -186,6 +195,7 @@ struct DashboardScreen: View {
                 await viewModel.agentSetupViewModel.refreshAgentStatuses()
             }
             await viewModel.refreshUsageSources()
+            _ = await relayModelCatalogService.scanConfiguredProviders(force: false)
         }
     }
     
@@ -965,6 +975,32 @@ struct DashboardScreen: View {
                     }
                 }
 
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await scanConfiguredProviderModels() }
+                    } label: {
+                        if relayModelCatalogService.isScanning {
+                            SmallProgressView()
+                        } else {
+                            Label("扫描已配置 API（每日）", systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(relayModelCatalogService.isScanning)
+
+                    if let lastScan = relayModelCatalogService.lastScanAt {
+                        Text("上次扫描：\(Self.dateTimeFormatter.string(from: lastScan))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let modelAutoScanStatus, !modelAutoScanStatus.isEmpty {
+                    Text(modelAutoScanStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 if let modelDiscoveryError, !modelDiscoveryError.isEmpty {
                     Text(modelDiscoveryError)
                         .font(.caption)
@@ -1011,6 +1047,11 @@ struct DashboardScreen: View {
         } catch {
             modelDiscoveryError = error.localizedDescription
         }
+    }
+
+    private func scanConfiguredProviderModels() async {
+        let summary = await relayModelCatalogService.scanConfiguredProviders(force: true)
+        modelAutoScanStatus = "扫描 \(summary.scannedProviders) 个 API，发现新模型 \(summary.newModels) 个，失败 \(summary.failedProviders) 个。"
     }
     
     // MARK: - Provider Section

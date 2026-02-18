@@ -458,6 +458,7 @@ final class AgentSetupViewModel {
     private func mergeCustomRelayModels(into models: [AvailableModel]) async -> [AvailableModel] {
         var merged = models
         var existing = Set(models.map(\.name))
+        let catalogService = RelayModelCatalogService.shared
 
         let enabledCustomProviders = await MainActor.run {
             CustomProviderService.shared.providers.filter(\.isEnabled)
@@ -498,6 +499,24 @@ final class AgentSetupViewModel {
                     )
                 )
                 existing.insert(alias)
+            }
+
+            // Auto-merge discovered models from daily model catalog scans.
+            let discoveredModelIDs = catalogService.discoveredModelIDs(for: provider.id)
+            for modelID in discoveredModelIDs {
+                let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedModelID.isEmpty else { continue }
+                guard !existing.contains(trimmedModelID) else { continue }
+
+                merged.append(
+                    AvailableModel(
+                        id: trimmedModelID,
+                        name: trimmedModelID,
+                        provider: providerLabel,
+                        isDefault: false
+                    )
+                )
+                existing.insert(trimmedModelID)
             }
         }
 
