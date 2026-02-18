@@ -401,6 +401,8 @@ final class AgentSetupViewModel {
         let preparedConfig = normalizedConfiguration(config, for: config.agent)
         currentConfiguration = preparedConfig
 
+        _ = await RelayModelCatalogService.shared.scanConfiguredProviders(force: false)
+
         do {
             let fetchedModels = try await configurationService.fetchAvailableModels(config: preparedConfig)
             let processedModels = processModels(fetchedModels)

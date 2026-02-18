@@ -994,7 +994,14 @@ final class QuotaViewModel {
     }
 
     var unifiedPeriodTokenUsage: [PeriodTokenUsage] {
-        let hasHealthyExternalSource = usageSourceSnapshots.values.contains { $0.isHealthy }
+        let hasHealthyExternalSource = usageSourceSnapshots.values.contains { snapshot in
+            guard snapshot.isHealthy else { return false }
+            return snapshot.dayTokens != nil
+                || snapshot.weekTokens != nil
+                || snapshot.monthTokens != nil
+                || snapshot.allTimeTokens != nil
+                || !snapshot.modelsByPeriod.isEmpty
+        }
         let shouldExcludeLocalClaude = deduplicateLocalClaudeUsage && hasHealthyExternalSource
         let localUsages: [PeriodTokenUsage]
         if shouldExcludeLocalClaude {

@@ -116,7 +116,34 @@ final class UsageSourceService {
         do {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            sources = try decoder.decode([UsageSource].self, from: data)
+            let decodedSources = try decoder.decode([UsageSource].self, from: data)
+            var migratedSources: [UsageSource] = []
+            migratedSources.reserveCapacity(decodedSources.count)
+            var hasMigrationChanges = false
+
+            for source in decodedSources {
+                var migrated = source
+                let originalURL = source.statsURL
+                let originalKind = source.kind
+                let trimmedURL = originalURL.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if trimmedURL != originalURL {
+                    migrated.statsURL = trimmedURL
+                    hasMigrationChanges = true
+                }
+
+                migrated.refreshKind()
+                if migrated.kind != originalKind {
+                    hasMigrationChanges = true
+                }
+
+                migratedSources.append(migrated)
+            }
+
+            sources = migratedSources
+            if hasMigrationChanges {
+                saveSources()
+            }
         } catch {
             sources = []
             lastError = "加载数据源失败：\(error.localizedDescription)"
