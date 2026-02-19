@@ -9,7 +9,8 @@ import UniformTypeIdentifiers
 struct DashboardScreen: View {
     @Environment(QuotaViewModel.self) private var viewModel
     @AppStorage("hideGettingStarted") private var hideGettingStarted: Bool = false
-    @AppStorage("dashboard.usage.deduplicateLocalClaude") private var deduplicateLocalClaudeUsage: Bool = true
+    @AppStorage("dashboard.usage.aggregationMode") private var usageAggregationModeRaw: String = UsageAggregationMode.automatic.rawValue
+    @AppStorage("dashboard.usage.showAdvancedMode") private var showAdvancedUsageMode: Bool = false
     @State private var modeManager = OperatingModeManager.shared
 
     @State private var selectedProvider: AIProvider?
@@ -96,8 +97,29 @@ struct DashboardScreen: View {
         Dictionary(grouping: viewModel.directAuthFiles) { $0.provider }
     }
 
+    private var periodUsageBreakdowns: [UnifiedUsagePeriodBreakdown] {
+        viewModel.unifiedPeriodUsageBreakdowns
+    }
+
     private var periodTokenUsage: [PeriodTokenUsage] {
-        viewModel.unifiedPeriodTokenUsage
+        periodUsageBreakdowns.map(\.usage)
+    }
+
+    private var usageAggregationMode: UsageAggregationMode {
+        UsageAggregationMode(rawValue: usageAggregationModeRaw) ?? .automatic
+    }
+
+    private var usageAggregationModeSelection: Binding<String> {
+        Binding(
+            get: { usageAggregationModeRaw },
+            set: { newValue in
+                if UsageAggregationMode(rawValue: newValue) != nil {
+                    usageAggregationModeRaw = newValue
+                } else {
+                    usageAggregationModeRaw = UsageAggregationMode.automatic.rawValue
+                }
+            }
+        )
     }
     
     var body: some View {
@@ -196,6 +218,11 @@ struct DashboardScreen: View {
             }
             await viewModel.refreshUsageSources()
             _ = await relayModelCatalogService.scanConfiguredProviders(force: false)
+        }
+        .onChange(of: showAdvancedUsageMode) { _, visible in
+            if !visible, usageAggregationModeRaw == UsageAggregationMode.mergeAdvanced.rawValue {
+                usageAggregationModeRaw = UsageAggregationMode.automatic.rawValue
+            }
         }
     }
     
@@ -717,7 +744,8 @@ struct DashboardScreen: View {
             VStack(alignment: .leading, spacing: 16) {
                 periodTokenSummaryCards
 
-                ForEach(periodTokenUsage) { usage in
+                ForEach(periodUsageBreakdowns) { breakdown in
+                    let usage = breakdown.usage
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text(usage.period.title)
@@ -733,6 +761,26 @@ struct DashboardScreen: View {
                         Text(periodRangeText(for: usage))
                             .font(.caption)
                             .foregroundStyle(.secondary)
+
+                        HStack(spacing: 8) {
+                            Text("最终 \(usage.totalTokens.formattedCompact)")
+                            Text("外部 \(breakdown.externalRawTokens.formattedCompact)")
+                            Text("本地 \(breakdown.localRawTokens.formattedCompact)")
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+
+                        if let reason = breakdown.fallbackReason, !reason.isEmpty {
+                            Text("口径：\(breakdown.effectiveMode.title) · \(reason)")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .lineLimit(2)
+                        } else {
+                            Text("口径：\(breakdown.effectiveMode.title)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
 
                         if usage.models.isEmpty || usage.totalTokens == 0 {
                             Text("该周期暂无令牌用量")
@@ -762,7 +810,7 @@ struct DashboardScreen: View {
                         }
                     }
 
-                    if usage.period != .month {
+                    if breakdown.period != .month {
                         Divider()
                     }
                 }
@@ -801,9 +849,50 @@ struct DashboardScreen: View {
 
     // MARK: - Usage Sources
 
+    private var usageAggregationModeControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("统计口径")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                Spacer()
+                Button(showAdvancedUsageMode ? "隐藏高级模式" : "显示高级模式") {
+                    showAdvancedUsageMode.toggle()
+                    if !showAdvancedUsageMode, usageAggregationMode == .mergeAdvanced {
+                        usageAggregationModeRaw = UsageAggregationMode.automatic.rawValue
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+            }
+
+            Picker("统计口径", selection: usageAggregationModeSelection) {
+                Text(UsageAggregationMode.automatic.title).tag(UsageAggregationMode.automatic.rawValue)
+                Text(UsageAggregationMode.localOnly.title).tag(UsageAggregationMode.localOnly.rawValue)
+                if showAdvancedUsageMode {
+                    Text(UsageAggregationMode.mergeAdvanced.title).tag(UsageAggregationMode.mergeAdvanced.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+
+            Text(viewModel.usageAggregationHeadline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if usageAggregationMode == .mergeAdvanced {
+                Text("高级模式用于调试，可能产生双重统计。")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
     private var usageSourcesSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
+                usageAggregationModeControls
+
                 if usageSourceService.sources.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("暂未配置外部用量数据源。")
@@ -814,13 +903,6 @@ struct DashboardScreen: View {
                             .foregroundStyle(.tertiary)
                     }
                 } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Toggle("防重复统计（外部源优先）", isOn: $deduplicateLocalClaudeUsage)
-                        Text("开启后：若已配置外部数据源，将不再把本地 Claude 请求重复计入总额。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
                     let sortedSources = usageSourceService.sources.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending })
                     ForEach(Array(sortedSources.enumerated()), id: \.element.id) { index, source in
                         usageSourceRow(source)
@@ -870,11 +952,16 @@ struct DashboardScreen: View {
 
     private func usageSourceRow(_ source: UsageSource) -> some View {
         let snapshot = viewModel.usageSourceSnapshots[source.id]
+        let healthState = viewModel.usageSourceHealthState(for: source)
+        let indicatorColor: Color = {
+            if !source.isEnabled { return .gray }
+            return healthState.isUsable ? .green : .red
+        }()
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
                 Circle()
-                    .fill(snapshot?.isHealthy == false ? Color.red : Color.green)
+                    .fill(indicatorColor)
                     .frame(width: 7, height: 7)
 
                 Text(source.name)
@@ -933,8 +1020,8 @@ struct DashboardScreen: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                if let status = snapshot.statusMessage, !status.isEmpty {
-                    Text(status)
+                if let reason = healthState.reason, !reason.isEmpty {
+                    Text(reason)
                         .font(.caption2)
                         .foregroundStyle(.orange)
                         .lineLimit(2)

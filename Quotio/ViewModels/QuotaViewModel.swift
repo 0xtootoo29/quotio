@@ -8,6 +8,64 @@ import SwiftUI
 import AppKit
 import Observation
 
+nonisolated enum UsageAggregationMode: String, CaseIterable, Codable, Sendable {
+    case automatic = "automaticExternalFallbackLocal"
+    case localOnly = "localOnly"
+    case mergeAdvanced = "mergeAdvanced"
+
+    var title: String {
+        switch self {
+        case .automatic:
+            return "自动（推荐）"
+        case .localOnly:
+            return "仅本地"
+        case .mergeAdvanced:
+            return "合并（高级）"
+        }
+    }
+}
+
+nonisolated enum UsageAggregationEffectiveMode: String, Sendable {
+    case externalPreferred
+    case localFallback
+    case localOnly
+    case mergeAdvanced
+
+    var title: String {
+        switch self {
+        case .externalPreferred:
+            return "外部优先"
+        case .localFallback:
+            return "本地回退"
+        case .localOnly:
+            return "仅本地"
+        case .mergeAdvanced:
+            return "合并（高级）"
+        }
+    }
+}
+
+nonisolated struct UnifiedUsagePeriodBreakdown: Identifiable, Sendable {
+    let period: TokenUsagePeriod
+    let usage: PeriodTokenUsage
+    let localRawTokens: Int
+    let externalRawTokens: Int
+    let localRawRequests: Int
+    let externalRawRequests: Int
+    let effectiveMode: UsageAggregationEffectiveMode
+    let fallbackReason: String?
+
+    var id: TokenUsagePeriod { period }
+}
+
+nonisolated struct UsageSourceHealthState: Sendable {
+    let isUsable: Bool
+    let reason: String?
+    let hasData: Bool
+    let isFresh: Bool
+    let consecutiveFailures: Int
+}
+
 @MainActor
 @Observable
 final class QuotaViewModel {
@@ -97,6 +155,7 @@ final class QuotaViewModel {
     var usageSourceSnapshots: [UUID: UsageSourceSnapshot] = [:]
     var isLoadingUsageSources = false
     var usageSourcesLastRefresh: Date?
+    var usageSourceConsecutiveFailures: [UUID: Int] = [:]
     
     /// Antigravity account switcher (for IDE token injection)
     let antigravitySwitcher = AntigravityAccountSwitcher.shared
@@ -137,7 +196,9 @@ final class QuotaViewModel {
     // MARK: - Disabled Auth Files Persistence
     
     private static let disabledAuthFilesKey = "persisted.disabledAuthFiles"
-    private static let usageDeduplicateLocalClaudeKey = "dashboard.usage.deduplicateLocalClaude"
+    private static let usageAggregationModeKey = "dashboard.usage.aggregationMode"
+    private static let usageSourceFreshnessThreshold: TimeInterval = 10 * 60
+    private static let usageSourceFailureThreshold = 3
 
     /// Load disabled auth file names from UserDefaults
     private func loadDisabledAuthFiles() -> Set<String> {
@@ -989,97 +1050,279 @@ final class QuotaViewModel {
     var totalAccounts: Int { authFiles.count }
     var readyAccounts: Int { authFiles.filter { $0.isReady }.count }
 
-    var deduplicateLocalClaudeUsage: Bool {
-        UserDefaults.standard.object(forKey: Self.usageDeduplicateLocalClaudeKey) as? Bool ?? true
+    var usageAggregationMode: UsageAggregationMode {
+        UsageAggregationMode(
+            rawValue: UserDefaults.standard.string(forKey: Self.usageAggregationModeKey) ?? ""
+        ) ?? .automatic
     }
 
-    var unifiedPeriodTokenUsage: [PeriodTokenUsage] {
-        let hasHealthyExternalSource = usageSourceSnapshots.values.contains { snapshot in
-            guard snapshot.isHealthy else { return false }
-            return snapshot.dayTokens != nil
-                || snapshot.weekTokens != nil
-                || snapshot.monthTokens != nil
-                || snapshot.allTimeTokens != nil
-                || !snapshot.modelsByPeriod.isEmpty
-        }
-        let shouldExcludeLocalClaude = deduplicateLocalClaudeUsage && hasHealthyExternalSource
-        let localUsages: [PeriodTokenUsage]
-        if shouldExcludeLocalClaude {
-            localUsages = requestTracker.periodTokenUsage(excludingProviders: ["claude", "anthropic"])
-        } else {
-            localUsages = requestTracker.periodTokenUsage
-        }
-        let localByPeriod = Dictionary(uniqueKeysWithValues: localUsages.map { ($0.period, $0) })
-        let calendar = Calendar.current
+    func setUsageAggregationMode(_ mode: UsageAggregationMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.usageAggregationModeKey)
+    }
+
+    var unifiedPeriodUsageBreakdowns: [UnifiedUsagePeriodBreakdown] {
+        let mode = usageAggregationMode
+        let localByPeriod = Dictionary(uniqueKeysWithValues: requestTracker.periodTokenUsage.map { ($0.period, $0) })
+        let enabledSources = usageSourceService.enabledSources
         let now = Date()
 
-        return TokenUsagePeriod.allCases.compactMap { period in
-            let local = localByPeriod[period]
-            guard let interval = calendar.dateInterval(
-                of: period == .day ? .day : (period == .week ? .weekOfYear : .month),
-                for: now
-            ) else {
-                return local
-            }
+        let sourceStates: [(source: UsageSource, snapshot: UsageSourceSnapshot?, state: UsageSourceHealthState)] = enabledSources.map { source in
+            (
+                source: source,
+                snapshot: usageSourceSnapshots[source.id],
+                state: usageSourceHealthState(for: source, now: now)
+            )
+        }
 
-            var modelBuckets: [String: (tokens: Int, requests: Int)] = [:]
+        return TokenUsagePeriod.allCases.map { period in
+            let localUsage = localByPeriod[period] ?? emptyPeriodUsage(for: period, now: now)
+            let localRawTokens = localUsage.totalTokens
+            let localRawRequests = localUsage.totalRequests
 
-            if let local {
-                for model in local.models {
-                    modelBuckets[model.model] = (model.tokenCount, model.requestCount)
-                }
+            let externalRawTokens = usageSourceSnapshots.values.reduce(0) { partial, snapshot in
+                partial + (externalTokenValue(from: snapshot, period: period) ?? 0)
             }
-
-            let externalTokens = usageSourceSnapshots.values.reduce(0) { partial, snapshot in
-                partial + (snapshot.tokens(for: period) ?? 0)
-            }
-            let externalRequests = usageSourceSnapshots.values.reduce(0) { partial, snapshot in
+            let externalRawRequests = usageSourceSnapshots.values.reduce(0) { partial, snapshot in
                 partial + snapshot.models(for: period).reduce(0) { $0 + $1.requestCount }
             }
 
-            for snapshot in usageSourceSnapshots.values {
-                for model in snapshot.models(for: period) {
-                    let existing = modelBuckets[model.model] ?? (0, 0)
-                    modelBuckets[model.model] = (
-                        tokens: existing.tokens + model.tokenCount,
-                        requests: existing.requests + model.requestCount
-                    )
-                }
+            let externalRawModels = usageSourceSnapshots.values.flatMap { $0.models(for: period) }
+            let usableSnapshots = sourceStates.compactMap { triple in
+                triple.state.isUsable ? triple.snapshot : nil
             }
 
-            let mergedModels = modelBuckets
-                .map { key, value in
-                    ModelTokenUsage(
-                        id: key,
-                        model: key,
-                        tokenCount: value.tokens,
-                        requestCount: value.requests
+            switch mode {
+            case .localOnly:
+                return UnifiedUsagePeriodBreakdown(
+                    period: period,
+                    usage: localUsage,
+                    localRawTokens: localRawTokens,
+                    externalRawTokens: externalRawTokens,
+                    localRawRequests: localRawRequests,
+                    externalRawRequests: externalRawRequests,
+                    effectiveMode: .localOnly,
+                    fallbackReason: nil
+                )
+
+            case .mergeAdvanced:
+                let mergedUsage = PeriodTokenUsage(
+                    period: period,
+                    startDate: localUsage.startDate,
+                    endDate: localUsage.endDate,
+                    totalTokens: localRawTokens + externalRawTokens,
+                    totalRequests: localRawRequests + externalRawRequests,
+                    models: mergeModelUsage(localModels: localUsage.models, externalModels: externalRawModels)
+                )
+                return UnifiedUsagePeriodBreakdown(
+                    period: period,
+                    usage: mergedUsage,
+                    localRawTokens: localRawTokens,
+                    externalRawTokens: externalRawTokens,
+                    localRawRequests: localRawRequests,
+                    externalRawRequests: externalRawRequests,
+                    effectiveMode: .mergeAdvanced,
+                    fallbackReason: "高级模式可能产生双计"
+                )
+
+            case .automatic:
+                guard !sourceStates.isEmpty else {
+                    return UnifiedUsagePeriodBreakdown(
+                        period: period,
+                        usage: localUsage,
+                        localRawTokens: localRawTokens,
+                        externalRawTokens: externalRawTokens,
+                        localRawRequests: localRawRequests,
+                        externalRawRequests: externalRawRequests,
+                        effectiveMode: .localFallback,
+                        fallbackReason: "未配置外部数据源"
                     )
                 }
-                .filter { $0.tokenCount > 0 }
-                .sorted { lhs, rhs in
-                    if lhs.tokenCount == rhs.tokenCount {
-                        return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
-                    }
-                    return lhs.tokenCount > rhs.tokenCount
+
+                if let failed = sourceStates.first(where: { !$0.state.isUsable }) {
+                    let reason = failed.state.reason ?? "外部源不可用"
+                    return UnifiedUsagePeriodBreakdown(
+                        period: period,
+                        usage: localUsage,
+                        localRawTokens: localRawTokens,
+                        externalRawTokens: externalRawTokens,
+                        localRawRequests: localRawRequests,
+                        externalRawRequests: externalRawRequests,
+                        effectiveMode: .localFallback,
+                        fallbackReason: "\(failed.source.name)：\(reason)"
+                    )
                 }
 
-            let totalTokens = (local?.totalTokens ?? 0) + externalTokens
-            let totalRequests = (local?.totalRequests ?? 0) + externalRequests
+                let tokenValues = usableSnapshots.compactMap { snapshot in
+                    externalTokenValue(from: snapshot, period: period)
+                }
+                guard tokenValues.count == usableSnapshots.count else {
+                    return UnifiedUsagePeriodBreakdown(
+                        period: period,
+                        usage: localUsage,
+                        localRawTokens: localRawTokens,
+                        externalRawTokens: externalRawTokens,
+                        localRawRequests: localRawRequests,
+                        externalRawRequests: externalRawRequests,
+                        effectiveMode: .localFallback,
+                        fallbackReason: "外部源未返回\(period.title)数据"
+                    )
+                }
 
-            return PeriodTokenUsage(
-                period: period,
-                startDate: interval.start,
-                endDate: interval.end,
-                totalTokens: totalTokens,
-                totalRequests: totalRequests,
-                models: mergedModels
-            )
+                let externalModels = usableSnapshots.flatMap { $0.models(for: period) }
+                let externalUsage = PeriodTokenUsage(
+                    period: period,
+                    startDate: localUsage.startDate,
+                    endDate: localUsage.endDate,
+                    totalTokens: tokenValues.reduce(0, +),
+                    totalRequests: usableSnapshots.reduce(0) { partial, snapshot in
+                        partial + snapshot.models(for: period).reduce(0) { $0 + $1.requestCount }
+                    },
+                    models: mergeModelUsage(localModels: [], externalModels: externalModels)
+                )
+                return UnifiedUsagePeriodBreakdown(
+                    period: period,
+                    usage: externalUsage,
+                    localRawTokens: localRawTokens,
+                    externalRawTokens: externalRawTokens,
+                    localRawRequests: localRawRequests,
+                    externalRawRequests: externalRawRequests,
+                    effectiveMode: .externalPreferred,
+                    fallbackReason: nil
+                )
+            }
+        }
+    }
+
+    var unifiedPeriodTokenUsage: [PeriodTokenUsage] {
+        unifiedPeriodUsageBreakdowns.map(\.usage)
+    }
+
+    var usageAggregationHeadline: String {
+        let mode = usageAggregationMode
+        switch mode {
+        case .automatic:
+            return "当前口径：自动（外部优先，失败回退本地）"
+        case .localOnly:
+            return "当前口径：仅本地"
+        case .mergeAdvanced:
+            return "当前口径：合并（高级）"
         }
     }
 
     var usageSourceAllTimeTokens: Int {
         usageSourceSnapshots.values.reduce(0) { $0 + ($1.allTimeTokens ?? 0) }
+    }
+
+    private func emptyPeriodUsage(for period: TokenUsagePeriod, now: Date) -> PeriodTokenUsage {
+        let calendar = Calendar.current
+        let component: Calendar.Component = switch period {
+        case .day: .day
+        case .week: .weekOfYear
+        case .month: .month
+        }
+        let interval = calendar.dateInterval(of: component, for: now) ?? DateInterval(start: now, end: now)
+        return PeriodTokenUsage(
+            period: period,
+            startDate: interval.start,
+            endDate: interval.end,
+            totalTokens: 0,
+            totalRequests: 0,
+            models: []
+        )
+    }
+
+    private func snapshotHasUsageData(_ snapshot: UsageSourceSnapshot) -> Bool {
+        snapshot.dayTokens != nil
+            || snapshot.weekTokens != nil
+            || snapshot.monthTokens != nil
+            || snapshot.allTimeTokens != nil
+            || !snapshot.modelsByPeriod.isEmpty
+    }
+
+    private func externalTokenValue(from snapshot: UsageSourceSnapshot, period: TokenUsagePeriod) -> Int? {
+        if let direct = snapshot.tokens(for: period) {
+            return direct
+        }
+        let modelTokens = snapshot.models(for: period).reduce(0) { $0 + $1.tokenCount }
+        return modelTokens > 0 ? modelTokens : nil
+    }
+
+    private func mergeModelUsage(localModels: [ModelTokenUsage], externalModels: [SourceModelUsage]) -> [ModelTokenUsage] {
+        var buckets: [String: (tokens: Int, requests: Int)] = [:]
+
+        for model in localModels {
+            buckets[model.model] = (model.tokenCount, model.requestCount)
+        }
+
+        for model in externalModels {
+            let existing = buckets[model.model] ?? (0, 0)
+            buckets[model.model] = (
+                tokens: existing.tokens + model.tokenCount,
+                requests: existing.requests + model.requestCount
+            )
+        }
+
+        return buckets
+            .map { key, value in
+                ModelTokenUsage(
+                    id: key,
+                    model: key,
+                    tokenCount: value.tokens,
+                    requestCount: value.requests
+                )
+            }
+            .filter { $0.tokenCount > 0 }
+            .sorted { lhs, rhs in
+                if lhs.tokenCount == rhs.tokenCount {
+                    return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
+                }
+                return lhs.tokenCount > rhs.tokenCount
+            }
+    }
+
+    func usageSourceHealthState(for source: UsageSource, now: Date = Date()) -> UsageSourceHealthState {
+        let snapshot = usageSourceSnapshots[source.id]
+        let failureCount = usageSourceConsecutiveFailures[source.id] ?? 0
+        guard let snapshot else {
+            return UsageSourceHealthState(
+                isUsable: false,
+                reason: "尚未抓取到数据",
+                hasData: false,
+                isFresh: false,
+                consecutiveFailures: failureCount
+            )
+        }
+
+        let hasData = snapshotHasUsageData(snapshot)
+        let isFresh = now.timeIntervalSince(snapshot.fetchedAt) <= Self.usageSourceFreshnessThreshold
+        let isUsable = snapshot.isHealthy
+            && hasData
+            && isFresh
+            && failureCount < Self.usageSourceFailureThreshold
+
+        let reason: String? = {
+            if !snapshot.isHealthy {
+                return snapshot.statusMessage ?? "抓取失败"
+            }
+            if !hasData {
+                return "返回空数据"
+            }
+            if !isFresh {
+                return "数据超过10分钟未更新"
+            }
+            if failureCount >= Self.usageSourceFailureThreshold {
+                return "连续失败\(failureCount)次"
+            }
+            return nil
+        }()
+
+        return UsageSourceHealthState(
+            isUsable: isUsable,
+            reason: reason,
+            hasData: hasData,
+            isFresh: isFresh,
+            consecutiveFailures: failureCount
+        )
     }
 
     func refreshUsageSources() async {
@@ -1088,6 +1331,7 @@ final class QuotaViewModel {
         let enabledSources = usageSourceService.enabledSources
         guard !enabledSources.isEmpty else {
             usageSourceSnapshots = [:]
+            usageSourceConsecutiveFailures = [:]
             usageSourcesLastRefresh = Date()
             return
         }
@@ -1113,7 +1357,21 @@ final class QuotaViewModel {
             return snapshots
         }
 
-        usageSourceSnapshots = Dictionary(uniqueKeysWithValues: fetched.map { ($0.sourceID, $0) })
+        let snapshotsByID = Dictionary(uniqueKeysWithValues: fetched.map { ($0.sourceID, $0) })
+        usageSourceSnapshots = snapshotsByID
+
+        var updatedFailures: [UUID: Int] = [:]
+        for source in enabledSources {
+            let previous = usageSourceConsecutiveFailures[source.id] ?? 0
+            guard let snapshot = snapshotsByID[source.id] else {
+                updatedFailures[source.id] = previous + 1
+                continue
+            }
+
+            let success = snapshot.isHealthy && snapshotHasUsageData(snapshot)
+            updatedFailures[source.id] = success ? 0 : (previous + 1)
+        }
+        usageSourceConsecutiveFailures = updatedFailures
     }
     
     func startProxy() async {
