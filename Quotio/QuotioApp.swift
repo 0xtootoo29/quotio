@@ -37,6 +37,9 @@ final class AppBootstrap {
         guard !hasInitialized else { return }
         hasInitialized = true
 
+        // Prime consolidated keychain vault once to avoid repeated prompts.
+        KeychainHelper.primeCache()
+
         appearanceManager.applyAppearance()
 
         // Check if onboarding is needed - if so, defer full initialization until after onboarding

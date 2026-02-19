@@ -193,8 +193,9 @@ final class AgentSetupViewModel {
     func applyConfiguration() async {
         guard let agent = selectedAgent,
               let config = currentConfiguration else { return }
-        
-        let preparedConfig = normalizedConfiguration(config, for: agent)
+
+        let migratedConfig = remappedConfigurationSlotsToAliases(config)
+        let preparedConfig = normalizedConfiguration(migratedConfig, for: agent)
         currentConfiguration = preparedConfig
 
         isConfiguring = true
@@ -408,6 +409,7 @@ final class AgentSetupViewModel {
             let processedModels = processModels(fetchedModels)
             let mergedModels = await mergeCustomRelayModels(into: processedModels)
             self.availableModels = mergedModels
+            remapCurrentModelSlotsToRoutableAliases()
             loadedFromRemote = true
 
             // Log model list
@@ -419,6 +421,7 @@ final class AgentSetupViewModel {
             if availableModels.isEmpty {
                 let mergedDefaults = await mergeCustomRelayModels(into: AvailableModel.allModels)
                 self.availableModels = mergedDefaults
+                remapCurrentModelSlotsToRoutableAliases()
                 logger.debug("[AgentSetupViewModel] Using \(mergedDefaults.count) default models")
             }
         }
@@ -457,9 +460,36 @@ final class AgentSetupViewModel {
         return AvailableModel.allModels.sorted { $0.displayName < $1.displayName }
     }
 
+    private func remapCurrentModelSlotsToRoutableAliases() {
+        guard let config = currentConfiguration else { return }
+        currentConfiguration = remappedConfigurationSlotsToAliases(config)
+    }
+
+    private func remappedConfigurationSlotsToAliases(_ config: AgentConfiguration) -> AgentConfiguration {
+        guard !availableModels.isEmpty else { return config }
+
+        var updated = config
+        for slot in ModelSlot.allCases {
+            guard let selectedModel = updated.modelSlots[slot], !selectedModel.isEmpty else { continue }
+
+            // Already routable in current list.
+            if availableModels.contains(where: { $0.id == selectedModel }) {
+                continue
+            }
+
+            // Migrate stale raw model IDs (e.g. claude-sonnet-4-6) to routed aliases.
+            if let aliasMatch = availableModels.first(where: { $0.routedModel == selectedModel }) {
+                updated.modelSlots[slot] = aliasMatch.id
+            }
+        }
+
+        return updated
+    }
+
     private func mergeCustomRelayModels(into models: [AvailableModel]) async -> [AvailableModel] {
         var merged = models
-        var existing = Set(models.map(\.name))
+        var existingIDs = Set(models.map(\.id))
+        var routedTargetsWithCustomAlias = Set<String>()
         let catalogService = RelayModelCatalogService.shared
 
         let enabledCustomProviders = await MainActor.run {
@@ -476,16 +506,22 @@ final class AgentSetupViewModel {
             for mapping in mappings {
                 let alias = mapping.effectiveAlias.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !alias.isEmpty else { continue }
+                let routedModel = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !routedModel.isEmpty else { continue }
 
-                if let existingIndex = merged.firstIndex(where: { $0.name == alias }) {
+                routedTargetsWithCustomAlias.insert(routedModel.lowercased())
+
+                if let existingIndex = merged.firstIndex(where: { $0.id == alias }) {
                     let existingModel = merged[existingIndex]
-                    if existingModel.routedModel == nil {
+                    if existingModel.routedModel == nil ||
+                        existingModel.name != routedModel ||
+                        existingModel.provider != providerLabel {
                         merged[existingIndex] = AvailableModel(
                             id: existingModel.id,
-                            name: existingModel.name,
-                            provider: existingModel.provider,
+                            name: routedModel,
+                            provider: providerLabel,
                             isDefault: existingModel.isDefault,
-                            routedModel: mapping.name
+                            routedModel: routedModel
                         )
                     }
                     continue
@@ -494,21 +530,27 @@ final class AgentSetupViewModel {
                 merged.append(
                     AvailableModel(
                         id: alias,
-                        name: alias,
+                        name: routedModel,
                         provider: providerLabel,
                         isDefault: false,
-                        routedModel: mapping.name
+                        routedModel: routedModel
                     )
                 )
-                existing.insert(alias)
+                existingIDs.insert(alias)
             }
 
             // Auto-merge discovered models from daily model catalog scans.
+            // For Claude relays we only expose routed aliases above, so every
+            // selectable model has a provider mapping in CLIProxy config.
+            if provider.type == .claudeCompatibility {
+                continue
+            }
+
             let discoveredModelIDs = catalogService.discoveredModelIDs(for: provider.id)
             for modelID in discoveredModelIDs {
                 let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmedModelID.isEmpty else { continue }
-                guard !existing.contains(trimmedModelID) else { continue }
+                guard !existingIDs.contains(trimmedModelID) else { continue }
 
                 merged.append(
                     AvailableModel(
@@ -518,11 +560,71 @@ final class AgentSetupViewModel {
                         isDefault: false
                     )
                 )
-                existing.insert(trimmedModelID)
+                existingIDs.insert(trimmedModelID)
             }
         }
 
-        return merged.sorted { $0.displayName < $1.displayName }
+        // If a routed alias exists for a real upstream model id, hide the generic
+        // upstream entry to avoid ambiguous duplicate choices in model picker.
+        if !routedTargetsWithCustomAlias.isEmpty {
+            merged.removeAll { model in
+                guard model.routedModel == nil else { return false }
+                guard isGenericUpstreamProviderLabel(model.provider) else { return false }
+                let normalizedID = model.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return routedTargetsWithCustomAlias.contains(normalizedID)
+            }
+        }
+
+        merged = deduplicateModelsByID(merged)
+
+        return merged.sorted { lhs, rhs in
+            let providerCompare = lhs.provider.localizedCaseInsensitiveCompare(rhs.provider)
+            if providerCompare != .orderedSame {
+                return providerCompare == .orderedAscending
+            }
+            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private func deduplicateModelsByID(_ models: [AvailableModel]) -> [AvailableModel] {
+        var bestByID: [String: AvailableModel] = [:]
+        var orderedIDs: [String] = []
+
+        for model in models {
+            if let existing = bestByID[model.id] {
+                if modelSpecificityScore(model) > modelSpecificityScore(existing) {
+                    bestByID[model.id] = model
+                }
+            } else {
+                bestByID[model.id] = model
+                orderedIDs.append(model.id)
+            }
+        }
+
+        return orderedIDs.compactMap { bestByID[$0] }
+    }
+
+    private func modelSpecificityScore(_ model: AvailableModel) -> Int {
+        var score = 0
+        if let routedModel = model.routedModel, !routedModel.isEmpty {
+            score += 4
+        }
+        if !isGenericUpstreamProviderLabel(model.provider) {
+            score += 2
+        }
+        if !model.provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            score += 1
+        }
+        return score
+    }
+
+    private func isGenericUpstreamProviderLabel(_ provider: String) -> Bool {
+        switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "anthropic", "openai", "google", "github-copilot", "fallback":
+            return true
+        default:
+            return false
+        }
     }
 
     /// Refresh virtual models - removes old ones and adds current ones

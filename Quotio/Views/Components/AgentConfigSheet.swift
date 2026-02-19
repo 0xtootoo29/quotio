@@ -865,17 +865,88 @@ private struct ModelSlotRow: View {
     let onModelChange: (String) -> Void
     
     private var effectiveSelection: String {
-        // Check if selected model exists in available list
-        if !selectedModel.isEmpty && availableModels.contains(where: { $0.name == selectedModel }) {
-            return selectedModel
+        // Current format: selected value stores model id (routable alias).
+        if !selectedModel.isEmpty,
+           let exactMatch = availableModels.first(where: { $0.id == selectedModel }) {
+            return exactMatch.id
         }
-        // Check if default model is available
+
+        // Backward compatibility: migrate old values that stored raw model names.
+        if !selectedModel.isEmpty,
+           let legacyMatch = availableModels.first(where: { model in
+               model.name == selectedModel || model.routedModel == selectedModel
+           }) {
+            return legacyMatch.id
+        }
+
+        // Check if default model is available.
         if let defaultModel = AvailableModel.defaultModels[slot],
-           availableModels.contains(where: { $0.name == defaultModel.name }) {
-            return defaultModel.name
+           let availableDefault = availableModels.first(where: { model in
+               model.id == defaultModel.id ||
+               model.name == defaultModel.name ||
+               model.routedModel == defaultModel.name
+           }) {
+            return availableDefault.id
         }
-        // Final fallback to first available model
-        return availableModels.first?.name ?? ""
+
+        // Final fallback to first available model.
+        return availableModels.first?.id ?? ""
+    }
+
+    private var providerGroups: [String: [AvailableModel]] {
+        Dictionary(grouping: availableModels, by: \.provider)
+    }
+
+    private var sortedProviders: [String] {
+        providerGroups.keys.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+    }
+
+    private func providerHeader(_ provider: String) -> String {
+        let trimmed = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Unknown" }
+
+        switch trimmed.lowercased() {
+        case "anthropic":
+            return "Anthropic"
+        case "openai":
+            return "OpenAI"
+        case "google":
+            return "Google"
+        case "github-copilot":
+            return "GitHub Copilot"
+        case "fallback":
+            return "Fallback"
+        default:
+            return trimmed
+        }
+    }
+
+    private func models(for provider: String) -> [AvailableModel] {
+        (providerGroups[provider] ?? []).sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+    }
+
+    private func menuLabel(for model: AvailableModel) -> String {
+        if let routedModel = model.routedModel,
+           !routedModel.isEmpty,
+           model.id != routedModel {
+            return "\(model.id) -> \(routedModel)"
+        }
+
+        if model.id != model.name {
+            return "\(model.displayName) [\(model.id)]"
+        }
+
+        return model.displayName
+    }
+
+    private func selectionExists(_ value: String) -> Bool {
+        availableModels.contains {
+            $0.id == value || $0.name == value || $0.routedModel == value
+        }
     }
     
     var body: some View {
@@ -890,13 +961,11 @@ private struct ModelSlotRow: View {
                 get: { effectiveSelection },
                 set: { onModelChange($0) }
             )) {
-                let providers = Set(availableModels.map { $0.provider }).sorted()
-                
-                ForEach(providers, id: \.self) { provider in
-                    Section(header: Text(provider.capitalized)) {
-                        ForEach(availableModels.filter { $0.provider == provider }) { model in
-                            Text(model.displayName)
-                                .tag(model.name)
+                ForEach(sortedProviders, id: \.self) { provider in
+                    Section(header: Text(providerHeader(provider))) {
+                        ForEach(models(for: provider)) { model in
+                            Text(menuLabel(for: model))
+                                .tag(model.id)
                         }
                     }
                 }
@@ -906,7 +975,7 @@ private struct ModelSlotRow: View {
         }
         .onAppear {
             // Trigger fallback update if model is empty or not in available list
-            if selectedModel.isEmpty || !availableModels.contains(where: { $0.name == selectedModel }) {
+            if selectedModel.isEmpty || !selectionExists(selectedModel) {
                 onModelChange(effectiveSelection)
             }
         }

@@ -459,24 +459,40 @@ extension CustomProvider {
     /// For Claude relay providers without explicit mappings, synthesize
     /// channel aliases so each relay can be selected independently.
     var effectiveModelMappingsForExport: [ModelMapping] {
-        if !models.isEmpty {
+        guard type == .claudeCompatibility else {
             return models
         }
 
-        guard type == .claudeCompatibility else {
-            return []
+        var mappings = models
+
+        // Keep stable channel aliases for Claude slot semantics when no explicit mapping is defined.
+        if mappings.isEmpty, let relaySlug = relayChannelSlug {
+            let slotModels = inferredSlotModels(forRelaySlug: relaySlug)
+            mappings.append(contentsOf: [
+                ModelMapping(name: slotModels.opus, alias: "\(relaySlug)-opus"),
+                ModelMapping(name: slotModels.sonnet, alias: "\(relaySlug)-sonnet"),
+                ModelMapping(name: slotModels.haiku, alias: "\(relaySlug)-haiku")
+            ])
         }
 
-        guard let relaySlug = relayChannelSlug else {
-            return []
+        // Auto-append newly discovered real model IDs as routable aliases.
+        // This prevents selecting a raw model ID that CLIProxyAPI cannot route.
+        if let relaySlug = relayChannelSlug {
+            for modelID in discoveredRelayModelIDsFromCatalog {
+                let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedModelID.isEmpty else { continue }
+
+                let alreadyMappedByName = mappings.contains {
+                    $0.name.caseInsensitiveCompare(trimmedModelID) == .orderedSame
+                }
+                guard !alreadyMappedByName else { continue }
+
+                let alias = generatedRelayAlias(for: trimmedModelID, relaySlug: relaySlug)
+                mappings.append(ModelMapping(name: trimmedModelID, alias: alias))
+            }
         }
 
-        let slotModels = inferredSlotModels(forRelaySlug: relaySlug)
-        return [
-            ModelMapping(name: slotModels.opus, alias: "\(relaySlug)-opus"),
-            ModelMapping(name: slotModels.sonnet, alias: "\(relaySlug)-sonnet"),
-            ModelMapping(name: slotModels.haiku, alias: "\(relaySlug)-haiku")
-        ]
+        return deduplicateMappingsByAlias(mappings)
     }
 
     /// Best-effort relay channel slug extracted from provider endpoint/name.
@@ -560,6 +576,34 @@ extension CustomProvider {
             sonnet: "claude-sonnet-4-5-20250929",
             haiku: "claude-haiku-4-5-20251001"
         )
+    }
+
+    private var discoveredRelayModelIDsFromCatalog: [String] {
+        guard let data = UserDefaults.standard.data(forKey: "relayModelCatalog.entries.v1"),
+              let entries = try? JSONDecoder().decode([RelayModelCatalogEntry].self, from: data),
+              let entry = entries.first(where: { $0.id == id }) else {
+            return []
+        }
+
+        return Array(Set(entry.models)).sorted()
+    }
+
+    private func generatedRelayAlias(for modelID: String, relaySlug: String) -> String {
+        "\(relaySlug)-\(sanitizeSlug(modelID))"
+    }
+
+    private func deduplicateMappingsByAlias(_ mappings: [ModelMapping]) -> [ModelMapping] {
+        var deduped: [ModelMapping] = []
+        var seenAliases = Set<String>()
+
+        for mapping in mappings {
+            let key = mapping.effectiveAlias.lowercased()
+            if seenAliases.insert(key).inserted {
+                deduped.append(mapping)
+            }
+        }
+
+        return deduped
     }
 }
 
