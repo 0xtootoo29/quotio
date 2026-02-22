@@ -227,6 +227,7 @@ final class CLIProxyManager {
         try? FileManager.default.createDirectory(atPath: authDir, withIntermediateDirectories: true)
         
         ensureConfigExists()
+        migrateLegacyRetryDefaultsIfNeeded()
     }
 
     /// Restart the proxy if it is currently running.
@@ -470,11 +471,48 @@ final class CLIProxyManager {
           switch-project: true
           switch-preview-model: true
 
-        request-retry: 3
-        max-retry-interval: 30
+        request-retry: 1
+        max-retry-interval: 10
         """
 
         try? defaultConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
+    }
+
+    /// One-time migration for safer retry defaults on relay instability scenarios.
+    /// Only rewrites retry settings when both legacy defaults are detected.
+    private func migrateLegacyRetryDefaultsIfNeeded() {
+        let migrationKey = "didMigrateRetryDefaults.v0_13_1"
+        guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+        guard FileManager.default.fileExists(atPath: configPath),
+              var content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+            return
+        }
+
+        let hasLegacyRetry = content.range(of: #"request-retry:\s*3"#, options: .regularExpression) != nil
+        let hasLegacyInterval = content.range(of: #"max-retry-interval:\s*30"#, options: .regularExpression) != nil
+        guard hasLegacyRetry && hasLegacyInterval else {
+            UserDefaults.standard.set(true, forKey: migrationKey)
+            return
+        }
+
+        content = content.replacingOccurrences(
+            of: #"request-retry:\s*3"#,
+            with: "request-retry: 1",
+            options: .regularExpression
+        )
+        content = content.replacingOccurrences(
+            of: #"max-retry-interval:\s*30"#,
+            with: "max-retry-interval: 10",
+            options: .regularExpression
+        )
+
+        do {
+            try content.write(toFile: configPath, atomically: true, encoding: .utf8)
+            UserDefaults.standard.set(true, forKey: migrationKey)
+            Log.proxy("Applied one-time retry defaults migration: retry=1, max-interval=10s")
+        } catch {
+            Log.proxy("Failed retry defaults migration: \(error.localizedDescription)")
+        }
     }
     
     private func syncSecretKeyInConfig() {

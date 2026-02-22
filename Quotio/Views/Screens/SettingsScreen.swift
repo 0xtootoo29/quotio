@@ -362,8 +362,8 @@ struct UnifiedProxySettingsSection: View {
     @State private var routingStrategy = "round-robin"
     @State private var switchProject = true
     @State private var switchPreviewModel = true
-    @State private var requestRetry = 3
-    @State private var maxRetryInterval = 30
+    @State private var requestRetry = 1
+    @State private var maxRetryInterval = 10
     @State private var loggingToFile = true
     @State private var requestLog = false
     @State private var debugMode = false
@@ -593,8 +593,8 @@ struct UnifiedProxySettingsSection: View {
             
             proxyURL = config.proxyURL ?? ""
             routingStrategy = fetchedStrategy
-            requestRetry = config.requestRetry ?? 3
-            maxRetryInterval = config.maxRetryInterval ?? 30
+            requestRetry = config.requestRetry ?? 1
+            maxRetryInterval = config.maxRetryInterval ?? 10
             loggingToFile = config.loggingToFile ?? true
             requestLog = config.requestLog ?? false
             debugMode = config.debug ?? false

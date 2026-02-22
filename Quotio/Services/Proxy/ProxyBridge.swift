@@ -91,6 +91,107 @@ struct FallbackContext: Sendable {
     )
 }
 
+// MARK: - Backpressure / Circuit Breaker
+
+private enum MessageRequestAdmission: Sendable {
+    case accepted
+    case rejected(message: String, retryAfterSeconds: Int)
+}
+
+private enum MessageRequestOutcome: Sendable {
+    case success
+    case transientFailure
+    case permanentFailure
+}
+
+private final class MessageRequestLifecycle: @unchecked Sendable {
+    nonisolated(unsafe) private let lock = NSLock()
+    nonisolated(unsafe) private var completed = false
+
+    nonisolated func completeOnce(_ action: () -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !completed else { return }
+        completed = true
+        action()
+    }
+}
+
+private final class MessageFlowController: @unchecked Sendable {
+    nonisolated(unsafe) private let lock = NSLock()
+    nonisolated(unsafe) private var activeMessageRequests = 0
+    nonisolated(unsafe) private var consecutiveTransientFailures = 0
+    nonisolated(unsafe) private var circuitOpenUntil: Date?
+
+    nonisolated(unsafe) private let maxConcurrentMessages: Int
+    nonisolated(unsafe) private let failureThreshold: Int
+    nonisolated(unsafe) private let cooldownSeconds: Int
+
+    init(maxConcurrentMessages: Int, failureThreshold: Int, cooldownSeconds: Int) {
+        self.maxConcurrentMessages = max(1, maxConcurrentMessages)
+        self.failureThreshold = max(2, failureThreshold)
+        self.cooldownSeconds = max(5, cooldownSeconds)
+    }
+
+    nonisolated func admit(now: Date = Date()) -> MessageRequestAdmission {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let openUntil = circuitOpenUntil {
+            if now < openUntil {
+                let remaining = max(1, Int(ceil(openUntil.timeIntervalSince(now))))
+                return .rejected(
+                    message: "Upstream relay is temporarily overloaded. Please retry shortly.",
+                    retryAfterSeconds: remaining
+                )
+            }
+            // Cooldown window ended; close breaker.
+            circuitOpenUntil = nil
+            consecutiveTransientFailures = 0
+        }
+
+        if activeMessageRequests >= maxConcurrentMessages {
+            return .rejected(
+                message: "Proxy bridge is busy with in-flight model requests. Please retry.",
+                retryAfterSeconds: 1
+            )
+        }
+
+        activeMessageRequests += 1
+        return .accepted
+    }
+
+    nonisolated func complete(outcome: MessageRequestOutcome, now: Date = Date()) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if activeMessageRequests > 0 {
+            activeMessageRequests -= 1
+        }
+
+        switch outcome {
+        case .success:
+            consecutiveTransientFailures = 0
+            circuitOpenUntil = nil
+
+        case .transientFailure:
+            if let openUntil = circuitOpenUntil, now < openUntil {
+                return
+            }
+
+            consecutiveTransientFailures += 1
+            if consecutiveTransientFailures >= failureThreshold {
+                circuitOpenUntil = now.addingTimeInterval(TimeInterval(cooldownSeconds))
+                consecutiveTransientFailures = 0
+            }
+
+        case .permanentFailure:
+            // Keep breaker state; these are not usually overload-related.
+            break
+        }
+    }
+}
+
 /// A lightweight TCP proxy that forwards requests to CLIProxyAPI while
 /// ensuring fresh connections by forcing "Connection: close" on all requests.
 @MainActor
@@ -125,6 +226,30 @@ final class ProxyBridge {
     
     /// Maximum concurrent connections to prevent resource exhaustion
     private let maxActiveConnections = 100
+
+    /// Message traffic concurrency and transient failure protection.
+    /// Hidden overrides can be provided via UserDefaults:
+    /// - proxyBridge.maxConcurrentMessages (default 6)
+    /// - proxyBridge.circuitFailureThreshold (default 3)
+    /// - proxyBridge.circuitCooldownSeconds (default 20)
+    private let messageFlowController: MessageFlowController = {
+        let defaults = UserDefaults.standard
+
+        let configuredMaxConcurrent = defaults.integer(forKey: "proxyBridge.maxConcurrentMessages")
+        let maxConcurrent = configuredMaxConcurrent > 0 ? min(configuredMaxConcurrent, 32) : 6
+
+        let configuredFailureThreshold = defaults.integer(forKey: "proxyBridge.circuitFailureThreshold")
+        let failureThreshold = configuredFailureThreshold > 0 ? min(configuredFailureThreshold, 10) : 3
+
+        let configuredCooldown = defaults.integer(forKey: "proxyBridge.circuitCooldownSeconds")
+        let cooldownSeconds = configuredCooldown > 0 ? min(configuredCooldown, 300) : 20
+
+        return MessageFlowController(
+            maxConcurrentMessages: maxConcurrent,
+            failureThreshold: failureThreshold,
+            cooldownSeconds: cooldownSeconds
+        )
+    }()
     
     /// Connection timeout in seconds (for target connection setup)
     private let connectionTimeoutSeconds: UInt64 = 10
@@ -256,7 +381,13 @@ final class ProxyBridge {
 
     private func handleNewConnection(_ connection: NWConnection) {
         if activeConnections >= maxActiveConnections {
-            connection.cancel()
+            connection.start(queue: .global(qos: .userInitiated))
+            sendError(
+                to: connection,
+                statusCode: 503,
+                message: "Proxy bridge is busy. Please retry in a moment.",
+                additionalHeaders: [("Retry-After", "1")]
+            )
             return
         }
 
@@ -432,6 +563,23 @@ final class ProxyBridge {
         }
 
         let metadata = extractMetadata(method: method, path: path, body: body)
+        let isMessageRequest = isClaudeMessagesRequest(method: method, path: path)
+
+        var messageLifecycle: MessageRequestLifecycle?
+        if isMessageRequest {
+            switch messageFlowController.admit() {
+            case .accepted:
+                messageLifecycle = MessageRequestLifecycle()
+            case .rejected(let message, let retryAfterSeconds):
+                sendError(
+                    to: connection,
+                    statusCode: 503,
+                    message: message,
+                    additionalHeaders: [("Retry-After", "\(retryAfterSeconds)")]
+                )
+                return
+            }
+        }
 
         // Check for virtual model and create fallback context
         Task { @MainActor [weak self] in
@@ -463,7 +611,9 @@ final class ProxyBridge {
                 metadata: metadata,
                 targetPort: targetPortValue,
                 targetHost: targetHostValue,
-                fallbackContext: fallbackContext
+                fallbackContext: fallbackContext,
+                isMessageRequest: isMessageRequest,
+                messageLifecycle: messageLifecycle
             )
         }
     }
@@ -608,6 +758,50 @@ final class ProxyBridge {
         }
         return String(body.prefix(limit))
     }
+
+    private nonisolated func isClaudeMessagesRequest(method: String, path: String) -> Bool {
+        guard method.uppercased() == "POST" else { return false }
+        let normalizedPath = path.lowercased()
+        return normalizedPath.contains("/v1/messages")
+            || normalizedPath.hasSuffix("/messages")
+            || normalizedPath.contains("/messages?")
+    }
+
+    private nonisolated func messageRequestOutcome(statusCode: Int?, responseData: Data) -> MessageRequestOutcome {
+        if let statusCode {
+            if (200..<300).contains(statusCode) {
+                return .success
+            }
+
+            if [408, 429, 500, 502, 503, 504].contains(statusCode) {
+                return .transientFailure
+            }
+
+            return .permanentFailure
+        }
+
+        let snippet = (responseBodySnippet(from: responseData, limit: 512) ?? "").lowercased()
+        if snippet.contains("unexpected eof")
+            || snippet.contains("internal_server_error")
+            || snippet.contains("timeout")
+            || snippet.contains("temporarily unavailable")
+            || snippet.contains("connection reset") {
+            return .transientFailure
+        }
+
+        return .permanentFailure
+    }
+
+    private nonisolated func completeMessageFlowIfNeeded(
+        isMessageRequest: Bool,
+        lifecycle: MessageRequestLifecycle?,
+        outcome: MessageRequestOutcome
+    ) {
+        guard isMessageRequest, let lifecycle else { return }
+        lifecycle.completeOnce { [messageFlowController] in
+            messageFlowController.complete(outcome: outcome)
+        }
+    }
     
     // MARK: - Metadata Extraction
     
@@ -665,10 +859,17 @@ final class ProxyBridge {
         metadata: (provider: String?, model: String?, method: String, path: String),
         targetPort: UInt16,
         targetHost: String,
-        fallbackContext: FallbackContext
+        fallbackContext: FallbackContext,
+        isMessageRequest: Bool,
+        messageLifecycle: MessageRequestLifecycle?
     ) {
         // Create connection to CLIProxyAPI
         guard let port = NWEndpoint.Port(rawValue: targetPort) else {
+            completeMessageFlowIfNeeded(
+                isMessageRequest: isMessageRequest,
+                lifecycle: messageLifecycle,
+                outcome: .transientFailure
+            )
             sendError(to: originalConnection, statusCode: 500, message: "Invalid target port")
             return
         }
@@ -730,6 +931,11 @@ final class ProxyBridge {
                 forwardedRequest += body
 
                 guard let requestData = forwardedRequest.data(using: .utf8) else {
+                    self.completeMessageFlowIfNeeded(
+                        isMessageRequest: isMessageRequest,
+                        lifecycle: messageLifecycle,
+                        outcome: .permanentFailure
+                    )
                     self.sendError(to: originalConnection, statusCode: 500, message: "Failed to encode request")
                     targetConnection.cancel()
                     return
@@ -737,8 +943,13 @@ final class ProxyBridge {
 
                 targetConnection.send(content: requestData, completion: .contentProcessed { error in
                     if error != nil {
+                        self.completeMessageFlowIfNeeded(
+                            isMessageRequest: isMessageRequest,
+                            lifecycle: messageLifecycle,
+                            outcome: .transientFailure
+                        )
+                        self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway - Failed to send upstream request")
                         targetConnection.cancel()
-                        originalConnection.cancel()
                     } else {
                         // Start receiving response
                         self.receiveResponse(
@@ -755,13 +966,20 @@ final class ProxyBridge {
                             path: capturedPath,
                             version: capturedVersion,
                             targetPort: targetPort,
-                            targetHost: targetHost
+                            targetHost: targetHost,
+                            isMessageRequest: isMessageRequest,
+                            messageLifecycle: messageLifecycle
                         )
                     }
                 })
 
             case .failed:
                 timeoutState.cancelled = true
+                self.completeMessageFlowIfNeeded(
+                    isMessageRequest: isMessageRequest,
+                    lifecycle: messageLifecycle,
+                    outcome: .transientFailure
+                )
                 self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway - Cannot connect to proxy")
                 targetConnection.cancel()
 
@@ -789,14 +1007,21 @@ final class ProxyBridge {
         path: String,
         version: String,
         targetPort: UInt16,
-        targetHost: String
+        targetHost: String,
+        isMessageRequest: Bool,
+        messageLifecycle: MessageRequestLifecycle?
     ) {
         targetConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
 
             if error != nil {
+                self.completeMessageFlowIfNeeded(
+                    isMessageRequest: isMessageRequest,
+                    lifecycle: messageLifecycle,
+                    outcome: .transientFailure
+                )
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway - Upstream connection lost")
                 targetConnection.cancel()
-                originalConnection.cancel()
                 return
             }
 
@@ -840,7 +1065,9 @@ final class ProxyBridge {
                                 metadata: metadata,
                                 targetPort: targetPort,
                                 targetHost: targetHost,
-                                fallbackContext: retryContext
+                                fallbackContext: retryContext,
+                                isMessageRequest: isMessageRequest,
+                                messageLifecycle: messageLifecycle
                             )
                             return
                         }
@@ -889,7 +1116,9 @@ final class ProxyBridge {
                             metadata: metadata,
                             targetPort: targetPort,
                             targetHost: targetHost,
-                            fallbackContext: nextContext
+                            fallbackContext: nextContext,
+                            isMessageRequest: isMessageRequest,
+                            messageLifecycle: messageLifecycle
                         )
                     }
                     return
@@ -899,6 +1128,17 @@ final class ProxyBridge {
             if let data = data, !data.isEmpty {
                 // Forward chunk to client
                 originalConnection.send(content: data, completion: .contentProcessed { sendError in
+                    if sendError != nil {
+                        self.completeMessageFlowIfNeeded(
+                            isMessageRequest: isMessageRequest,
+                            lifecycle: messageLifecycle,
+                            outcome: .transientFailure
+                        )
+                        targetConnection.cancel()
+                        originalConnection.cancel()
+                        return
+                    }
+
                     if isComplete {
                         // Request complete - record metadata
                         self.recordCompletion(
@@ -908,7 +1148,9 @@ final class ProxyBridge {
                             responseSize: accumulatedResponse.count,
                             responseData: accumulatedResponse,
                             metadata: metadata,
-                            fallbackContext: fallbackContext
+                            fallbackContext: fallbackContext,
+                            isMessageRequest: isMessageRequest,
+                            messageLifecycle: messageLifecycle
                         )
 
                         targetConnection.cancel()
@@ -932,7 +1174,9 @@ final class ProxyBridge {
                                 path: path,
                                 version: version,
                                 targetPort: targetPort,
-                                targetHost: targetHost
+                                targetHost: targetHost,
+                                isMessageRequest: isMessageRequest,
+                                messageLifecycle: messageLifecycle
                             )
                         }
                     }
@@ -946,7 +1190,9 @@ final class ProxyBridge {
                     responseSize: accumulatedResponse.count,
                     responseData: accumulatedResponse,
                     metadata: metadata,
-                    fallbackContext: fallbackContext
+                    fallbackContext: fallbackContext,
+                    isMessageRequest: isMessageRequest,
+                    messageLifecycle: messageLifecycle
                 )
 
                 targetConnection.cancel()
@@ -966,7 +1212,9 @@ final class ProxyBridge {
         responseSize: Int,
         responseData: Data,
         metadata: (provider: String?, model: String?, method: String, path: String),
-        fallbackContext: FallbackContext
+        fallbackContext: FallbackContext,
+        isMessageRequest: Bool,
+        messageLifecycle: MessageRequestLifecycle?
     ) {
         let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
 
@@ -980,6 +1228,13 @@ final class ProxyBridge {
                 statusCode = code
             }
         }
+
+        let messageOutcome = messageRequestOutcome(statusCode: statusCode, responseData: responseData)
+        completeMessageFlowIfNeeded(
+            isMessageRequest: isMessageRequest,
+            lifecycle: messageLifecycle,
+            outcome: messageOutcome
+        )
 
         let tokenUsage = extractUsageTokens(fromHTTPResponseData: responseData)
 
@@ -1358,7 +1613,12 @@ final class ProxyBridge {
     
     // MARK: - Error Response
     
-    private nonisolated func sendError(to connection: NWConnection, statusCode: Int, message: String) {
+    private nonisolated func sendError(
+        to connection: NWConnection,
+        statusCode: Int,
+        message: String,
+        additionalHeaders: [(String, String)] = []
+    ) {
         guard let bodyData = message.data(using: .utf8) else {
             connection.cancel()
             return
@@ -1376,11 +1636,14 @@ final class ProxyBridge {
         }
         
         // Build HTTP response with proper CRLF line endings (no leading whitespace)
-        let headers = "HTTP/1.1 \(statusCode) \(reasonPhrase)\r\n" +
+        var headers = "HTTP/1.1 \(statusCode) \(reasonPhrase)\r\n" +
             "Content-Type: text/plain\r\n" +
             "Content-Length: \(bodyData.count)\r\n" +
-            "Connection: close\r\n" +
-            "\r\n"
+            "Connection: close\r\n"
+        for (name, value) in additionalHeaders {
+            headers += "\(name): \(value)\r\n"
+        }
+        headers += "\r\n"
         
         guard let headerData = headers.data(using: .utf8) else {
             connection.cancel()

@@ -421,8 +421,8 @@ nonisolated struct AppConfig: Codable {
     var debug: Bool = false
     var loggingToFile: Bool = false
     var usageStatisticsEnabled: Bool = true
-    var requestRetry: Int = 3
-    var maxRetryInterval: Int = 30
+    var requestRetry: Int = 1
+    var maxRetryInterval: Int = 10
     var wsAuth: Bool = false
     var routing: RoutingConfig = RoutingConfig()
     var quotaExceeded: QuotaExceededConfig = QuotaExceededConfig()
