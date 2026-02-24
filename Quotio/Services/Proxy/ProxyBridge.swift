@@ -562,8 +562,18 @@ final class ProxyBridge {
             body = String(requestString[bodyRange.upperBound...])
         }
 
-        let metadata = extractMetadata(method: method, path: path, body: body)
-        let isMessageRequest = isClaudeMessagesRequest(method: method, path: path)
+        let modelID = extractModelID(fromRequestBody: body)
+        let shouldSanitizeBeta = shouldSanitizeAnthropicBeta(forModelID: modelID)
+        let forwardedPath = shouldSanitizeBeta ? removingBetaQueryFromPath(path) : path
+        var forwardedHeaders = headers
+        if shouldSanitizeBeta {
+            forwardedHeaders.removeAll { header in
+                header.0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "anthropic-beta"
+            }
+        }
+
+        let metadata = extractMetadata(method: method, path: forwardedPath, body: body)
+        let isMessageRequest = isClaudeMessagesRequest(method: method, path: forwardedPath)
 
         var messageLifecycle: MessageRequestLifecycle?
         if isMessageRequest {
@@ -600,9 +610,9 @@ final class ProxyBridge {
 
             self.forwardRequest(
                 method: method,
-                path: path,
+                path: forwardedPath,
                 version: httpVersion,
-                headers: headers,
+                headers: forwardedHeaders,
                 body: resolvedBody,
                 originalConnection: connection,
                 connectionId: connectionId,
@@ -757,6 +767,102 @@ final class ProxyBridge {
             return nil
         }
         return String(body.prefix(limit))
+    }
+
+    private nonisolated func extractModelID(fromRequestBody body: String) -> String? {
+        guard let bodyData = body.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let modelID = json["model"] as? String else {
+            return nil
+        }
+        return modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Certain third-party relay routes are unstable when Anthropic beta query/headers are forwarded as-is.
+    /// We sanitize those fields for relay aliases configured in Quotio's config file,
+    /// and keep a conservative fallback for MiniMax/GLM pattern-based aliases.
+    private nonisolated func shouldSanitizeAnthropicBeta(forModelID modelID: String?) -> Bool {
+        guard let modelID = modelID?.lowercased(), !modelID.isEmpty else { return false }
+
+        if configuredRelayAliases().contains(modelID) {
+            return true
+        }
+
+        return modelID.contains("minimax") || modelID.contains("glm")
+    }
+
+    /// Parse configured relay aliases from `~/Library/Application Support/Quotio/config.yaml`.
+    /// We only read aliases inside the `claude-api-key:` section to avoid touching unrelated mappings.
+    private nonisolated func configuredRelayAliases() -> Set<String> {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return []
+        }
+
+        let configPath = appSupport.appendingPathComponent("Quotio/config.yaml").path
+        guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+            return []
+        }
+
+        let aliasRegex: NSRegularExpression
+        do {
+            aliasRegex = try NSRegularExpression(pattern: #"alias:\s*"([^"]+)""#)
+        } catch {
+            return []
+        }
+
+        var aliases = Set<String>()
+        var inClaudeSection = false
+
+        for line in content.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed == "claude-api-key:" {
+                inClaudeSection = true
+                continue
+            }
+
+            if inClaudeSection {
+                // Exit when a new top-level YAML key starts.
+                if !line.hasPrefix(" ") && !line.hasPrefix("\t") && !trimmed.isEmpty {
+                    break
+                }
+
+                let nsLine = line as NSString
+                let fullRange = NSRange(location: 0, length: nsLine.length)
+                if let match = aliasRegex.firstMatch(in: line, range: fullRange), match.numberOfRanges > 1 {
+                    let alias = nsLine.substring(with: match.range(at: 1))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                    if !alias.isEmpty {
+                        aliases.insert(alias)
+                    }
+                }
+            }
+        }
+
+        return aliases
+    }
+
+    private nonisolated func removingBetaQueryFromPath(_ path: String) -> String {
+        guard let questionMark = path.firstIndex(of: "?") else { return path }
+
+        let basePath = String(path[..<questionMark])
+        let query = String(path[path.index(after: questionMark)...])
+        if query.isEmpty { return basePath }
+
+        let filteredPairs = query
+            .split(separator: "&")
+            .map(String.init)
+            .filter { pair in
+                let lower = pair.lowercased()
+                if lower == "beta=true" || lower == "beta=1" || lower == "beta" {
+                    return false
+                }
+                return true
+            }
+
+        guard !filteredPairs.isEmpty else { return basePath }
+        return basePath + "?" + filteredPairs.joined(separator: "&")
     }
 
     private nonisolated func isClaudeMessagesRequest(method: String, path: String) -> Bool {
