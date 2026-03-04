@@ -477,6 +477,12 @@ final class AgentSetupViewModel {
                 continue
             }
 
+            // Migrate legacy relay aliases (e.g. qwen-glm-5 -> relay-qwen-relay-glm-5).
+            if let migratedAlias = migratedRelayAliasFromLegacy(selectedModel) {
+                updated.modelSlots[slot] = migratedAlias
+                continue
+            }
+
             // Migrate stale raw model IDs (e.g. claude-sonnet-4-6) to routed aliases.
             if let aliasMatch = availableModels.first(where: { $0.routedModel == selectedModel }) {
                 updated.modelSlots[slot] = aliasMatch.id
@@ -484,6 +490,64 @@ final class AgentSetupViewModel {
         }
 
         return updated
+    }
+
+    private func migratedRelayAliasFromLegacy(_ selectedModel: String) -> String? {
+        let normalizedSelected = selectedModel
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalizedSelected.isEmpty else { return nil }
+
+        for model in availableModels {
+            let currentAlias = model.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !currentAlias.isEmpty else { continue }
+            guard let routedModel = model.routedModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !routedModel.isEmpty else {
+                continue
+            }
+
+            let providerSlug = sanitizeRelaySlug(model.provider)
+            guard !providerSlug.isEmpty else { continue }
+
+            let routedSlug = sanitizeRelaySlug(routedModel)
+            var legacyCandidates: Set<String> = [
+                "\(providerSlug)-\(routedSlug)".lowercased(),
+                "\(providerSlug)-relay-\(routedSlug)".lowercased()
+            ]
+
+            if providerSlug.hasPrefix("relay-") {
+                let rawSlug = String(providerSlug.dropFirst("relay-".count))
+                if !rawSlug.isEmpty {
+                    legacyCandidates.insert("\(rawSlug)-\(routedSlug)".lowercased())
+                    legacyCandidates.insert("\(rawSlug)-relay-\(routedSlug)".lowercased())
+                }
+            } else {
+                legacyCandidates.insert("relay-\(providerSlug)-\(routedSlug)".lowercased())
+            }
+
+            if legacyCandidates.contains(normalizedSelected),
+               normalizedSelected != currentAlias.lowercased() {
+                return currentAlias
+            }
+        }
+
+        return nil
+    }
+
+    private func sanitizeRelaySlug(_ raw: String) -> String {
+        let lowered = raw.lowercased()
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
+        let filteredScalars = lowered.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        let filtered = String(filteredScalars)
+        let dedupedDashes = filtered.replacingOccurrences(
+            of: "-+",
+            with: "-",
+            options: .regularExpression
+        )
+        let trimmed = dedupedDashes.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return trimmed.isEmpty ? "relay" : trimmed
     }
 
     private func mergeCustomRelayModels(into models: [AvailableModel]) async -> [AvailableModel] {

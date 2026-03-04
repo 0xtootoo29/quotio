@@ -48,12 +48,6 @@ final class RelayModelCatalogService {
             return .empty
         }
 
-        if !force,
-           let lastScanAt,
-           Date().timeIntervalSince(lastScanAt) < autoScanInterval {
-            return .empty
-        }
-
         let configuredProviders = CustomProviderService.shared.providers.filter { provider in
             provider.isEnabled
                 && !provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -61,6 +55,29 @@ final class RelayModelCatalogService {
         }
 
         guard !configuredProviders.isEmpty else {
+            return .empty
+        }
+
+        let providersToScan: [CustomProvider]
+        if force {
+            providersToScan = configuredProviders
+        } else {
+            providersToScan = configuredProviders.filter { provider in
+                guard let existing = entries[provider.id] else {
+                    // New provider should be scanned immediately.
+                    return true
+                }
+
+                if existing.lastError != nil {
+                    // Retry failed providers without waiting a full day.
+                    return true
+                }
+
+                return Date().timeIntervalSince(existing.lastScannedAt) >= autoScanInterval
+            }
+        }
+
+        guard !providersToScan.isEmpty else {
             return .empty
         }
 
@@ -73,7 +90,7 @@ final class RelayModelCatalogService {
         var newModels = 0
         var failedProviders = 0
 
-        for provider in configuredProviders {
+        for provider in providersToScan {
             let baseURL = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let token = provider.apiKeys.first(where: { !$0.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?.apiKey else {
                 continue

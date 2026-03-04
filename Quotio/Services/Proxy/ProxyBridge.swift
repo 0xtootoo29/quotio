@@ -91,6 +91,11 @@ struct FallbackContext: Sendable {
     )
 }
 
+private struct RelayAliasRoute: Sendable {
+    let alias: String
+    let modelName: String
+}
+
 // MARK: - Backpressure / Circuit Breaker
 
 private enum MessageRequestAdmission: Sendable {
@@ -572,8 +577,27 @@ final class ProxyBridge {
             }
         }
 
-        let metadata = extractMetadata(method: method, path: forwardedPath, body: body)
         let isMessageRequest = isClaudeMessagesRequest(method: method, path: forwardedPath)
+        if isMessageRequest, shouldSanitizeTopLevelThinking(forModelID: modelID) {
+            body = sanitizeTopLevelThinking(body)
+        }
+
+        let metadata = extractMetadata(method: method, path: forwardedPath, body: body)
+        if isClaudeCountTokensRequest(method: method, path: forwardedPath),
+           shouldShortCircuitCountTokens(forModelID: modelID) {
+            let estimatedInputTokens = estimateCountTokensInput(fromRequestBody: body)
+            let payload: [String: Any] = [
+                "input_tokens": estimatedInputTokens,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            ]
+            sendJSONResponse(
+                to: connection,
+                statusCode: 200,
+                jsonObject: payload
+            )
+            return
+        }
 
         var messageLifecycle: MessageRequestLifecycle?
         if isMessageRequest {
@@ -752,6 +776,23 @@ final class ProxyBridge {
         return newBody
     }
 
+    private nonisolated func sanitizeTopLevelThinking(_ body: String) -> String {
+        guard let bodyData = body.data(using: .utf8),
+              var json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              json["thinking"] != nil else {
+            return body
+        }
+
+        json.removeValue(forKey: "thinking")
+
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]),
+              let newBody = String(data: newData, encoding: .utf8) else {
+            return body
+        }
+
+        return newBody
+    }
+
     /// Check why a response should trigger fallback (if any)
     private nonisolated func fallbackReason(responseData: Data) -> FallbackTriggerReason? {
         return FallbackFormatConverter.fallbackReason(responseData: responseData)
@@ -782,42 +823,102 @@ final class ProxyBridge {
     /// We sanitize those fields for relay aliases configured in Quotio's config file,
     /// and keep a conservative fallback for MiniMax/GLM pattern-based aliases.
     private nonisolated func shouldSanitizeAnthropicBeta(forModelID modelID: String?) -> Bool {
-        guard let modelID = modelID?.lowercased(), !modelID.isEmpty else { return false }
+        guard let normalizedModelID = modelID?.lowercased(), !normalizedModelID.isEmpty else { return false }
 
-        if configuredRelayAliases().contains(modelID) {
+        if let route = configuredRelayAliasRoutes()[normalizedModelID] {
+            return shouldSanitizeRelayModelName(route.modelName, alias: normalizedModelID)
+        }
+
+        return shouldSanitizeRelayModelName(normalizedModelID, alias: normalizedModelID)
+    }
+
+    private nonisolated func shouldSanitizeTopLevelThinking(forModelID modelID: String?) -> Bool {
+        guard let normalizedModelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalizedModelID.isEmpty else { return false }
+
+        if let route = configuredRelayAliasRoutes()[normalizedModelID],
+           isLikelyCopilotHostedModelID(route.modelName) {
             return true
         }
 
-        return modelID.contains("minimax") || modelID.contains("glm")
+        return isLikelyCopilotHostedModelID(normalizedModelID)
     }
 
-    /// Parse configured relay aliases from `~/Library/Application Support/Quotio/config.yaml`.
-    /// We only read aliases inside the `claude-api-key:` section to avoid touching unrelated mappings.
-    private nonisolated func configuredRelayAliases() -> Set<String> {
+    private nonisolated func shouldSanitizeRelayModelName(_ modelName: String, alias: String) -> Bool {
+        let normalizedModel = modelName.lowercased()
+        let normalizedAlias = alias.lowercased()
+
+        // GitHub Copilot-hosted models exposed on Anthropic-compatible endpoint
+        // frequently reject Anthropic beta flags. Clean them proactively.
+        if isLikelyCopilotHostedModelID(normalizedModel) || isLikelyCopilotHostedModelID(normalizedAlias) {
+            return true
+        }
+
+        // Keep Anthropic-native routes untouched; these often rely on beta semantics.
+        if isLikelyClaudeRelayModel(normalizedModel) || isLikelyClaudeRelayModel(normalizedAlias) {
+            return false
+        }
+
+        let unstableRelayHints = [
+            "minimax", "glm", "qwen", "kimi",
+            "moonshot", "deepseek", "doubao",
+            "yi-", "grok", "mistral", "llama"
+        ]
+
+        return unstableRelayHints.contains(where: normalizedModel.contains)
+            || unstableRelayHints.contains(where: normalizedAlias.contains)
+    }
+
+    private nonisolated func isLikelyClaudeRelayModel(_ value: String) -> Bool {
+        value.contains("claude")
+            || value.contains("sonnet")
+            || value.contains("opus")
+            || value.contains("haiku")
+    }
+
+    private nonisolated func isLikelyCopilotHostedModelID(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+
+        // Copilot model IDs commonly use dotted versions (e.g. claude-opus-4.6, gpt-5.2).
+        guard normalized.contains(".") else { return false }
+
+        return normalized.hasPrefix("claude-")
+            || normalized.hasPrefix("gpt-")
+            || normalized.hasPrefix("gemini-")
+            || normalized.hasPrefix("grok-")
+            || normalized.hasPrefix("oswe-")
+    }
+
+    /// Parse relay alias -> routed model mappings from `claude-api-key` section.
+    private nonisolated func configuredRelayAliasRoutes() -> [String: RelayAliasRoute] {
         guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return []
+            return [:]
         }
 
         let configPath = appSupport.appendingPathComponent("Quotio/config.yaml").path
         guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
-            return []
+            return [:]
         }
 
-        let aliasRegex: NSRegularExpression
-        do {
-            aliasRegex = try NSRegularExpression(pattern: #"alias:\s*"([^"]+)""#)
-        } catch {
-            return []
-        }
-
-        var aliases = Set<String>()
+        var routes: [String: RelayAliasRoute] = [:]
         var inClaudeSection = false
+        var currentModelName: String?
+
+        func parseQuotedValue(from line: String, key: String) -> String? {
+            guard let keyRange = line.range(of: "\(key):") else { return nil }
+            let tail = line[keyRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard tail.hasPrefix("\"") else { return nil }
+            guard let endQuote = tail.dropFirst().firstIndex(of: "\"") else { return nil }
+            return String(tail[tail.index(after: tail.startIndex)..<endQuote]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
 
         for line in content.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
 
             if trimmed == "claude-api-key:" {
                 inClaudeSection = true
+                currentModelName = nil
                 continue
             }
 
@@ -827,20 +928,25 @@ final class ProxyBridge {
                     break
                 }
 
-                let nsLine = line as NSString
-                let fullRange = NSRange(location: 0, length: nsLine.length)
-                if let match = aliasRegex.firstMatch(in: line, range: fullRange), match.numberOfRanges > 1 {
-                    let alias = nsLine.substring(with: match.range(at: 1))
+                if trimmed.hasPrefix("- name:") || trimmed.hasPrefix("name:") {
+                    currentModelName = parseQuotedValue(from: trimmed, key: "name")
+                    continue
+                }
+
+                if trimmed.hasPrefix("alias:"),
+                   let modelName = currentModelName,
+                   let aliasRaw = parseQuotedValue(from: trimmed, key: "alias") {
+                    let alias = aliasRaw
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                         .lowercased()
                     if !alias.isEmpty {
-                        aliases.insert(alias)
+                        routes[alias] = RelayAliasRoute(alias: alias, modelName: modelName)
                     }
                 }
             }
         }
 
-        return aliases
+        return routes
     }
 
     private nonisolated func removingBetaQueryFromPath(_ path: String) -> String {
@@ -871,6 +977,40 @@ final class ProxyBridge {
         return normalizedPath.contains("/v1/messages")
             || normalizedPath.hasSuffix("/messages")
             || normalizedPath.contains("/messages?")
+    }
+
+    private nonisolated func isClaudeCountTokensRequest(method: String, path: String) -> Bool {
+        guard method.uppercased() == "POST" else { return false }
+        let normalizedPath = path.lowercased()
+        return normalizedPath.contains("/v1/messages/count_tokens")
+            || normalizedPath.hasSuffix("/messages/count_tokens")
+            || normalizedPath.contains("/messages/count_tokens?")
+    }
+
+    private nonisolated func shouldShortCircuitCountTokens(forModelID modelID: String?) -> Bool {
+        guard let modelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !modelID.isEmpty else {
+            return false
+        }
+
+        if configuredRelayAliasRoutes()[modelID] != nil {
+            return true
+        }
+
+        // Copilot-hosted models on Anthropic endpoint return 501 for count_tokens.
+        if isLikelyCopilotHostedModelID(modelID) {
+            return true
+        }
+
+        return false
+    }
+
+    private nonisolated func estimateCountTokensInput(fromRequestBody body: String) -> Int {
+        let bytes = body.utf8.count
+        // Practical heuristic for compatibility relays that do not expose count_tokens.
+        // We prefer a stable non-zero estimate over returning 4xx and poisoning routing state.
+        let estimated = max(1, bytes / 4)
+        return min(estimated, 200_000)
     }
 
     private nonisolated func messageRequestOutcome(statusCode: Int?, responseData: Data) -> MessageRequestOutcome {
@@ -1760,6 +1900,49 @@ final class ProxyBridge {
         responseData.append(headerData)
         responseData.append(bodyData)
         
+        connection.send(content: responseData, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    private nonisolated func sendJSONResponse(
+        to connection: NWConnection,
+        statusCode: Int,
+        jsonObject: [String: Any]
+    ) {
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: []),
+              let bodyString = String(data: bodyData, encoding: .utf8),
+              let encodedBody = bodyString.data(using: .utf8) else {
+            sendError(to: connection, statusCode: 500, message: "Failed to encode JSON response")
+            return
+        }
+
+        let reasonPhrase: String
+        switch statusCode {
+        case 200: reasonPhrase = "OK"
+        case 400: reasonPhrase = "Bad Request"
+        case 404: reasonPhrase = "Not Found"
+        case 500: reasonPhrase = "Internal Server Error"
+        default: reasonPhrase = "OK"
+        }
+
+        let headers = """
+        HTTP/1.1 \(statusCode) \(reasonPhrase)\r
+        Content-Type: application/json\r
+        Content-Length: \(encodedBody.count)\r
+        Connection: close\r
+        \r
+        """
+
+        guard let headerData = headers.data(using: .utf8) else {
+            sendError(to: connection, statusCode: 500, message: "Failed to encode response headers")
+            return
+        }
+
+        var responseData = Data()
+        responseData.append(headerData)
+        responseData.append(encodedBody)
+
         connection.send(content: responseData, completion: .contentProcessed { _ in
             connection.cancel()
         })
